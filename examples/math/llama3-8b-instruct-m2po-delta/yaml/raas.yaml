@@ -13,7 +13,7 @@
 # ============================================================================
 
 rollout:
-  max_concurrent_rollouts: 512
+  max_concurrent_rollouts: 1024
   # Cap concurrent eval prefills to bound peak KV pressure during the
   # ~3.5k-item eval burst (5 datasets x repeat=4) — default 128 OOMs sglang.
   max_concurrent_evals: 64
@@ -32,7 +32,7 @@ engine:
 sglang:
   # Native Llama-3-8B context is 8192; stay within it (no rope_scaling).
   context_length: 8192
-  mem_fraction_static: 0.7
+  mem_fraction_static: 0.8
   # Chunk prefill so the LM-head fp32 logits upcast can't spike and OOM a
   # worker. Bounds per-forward tokens to 8192.
   chunked_prefill_size: 8192

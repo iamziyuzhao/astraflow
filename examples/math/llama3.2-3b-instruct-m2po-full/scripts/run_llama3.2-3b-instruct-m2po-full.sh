@@ -49,7 +49,7 @@ astraflow_setup_env
 # =============================================================================
 # Part 3: Print info and clean up
 # =============================================================================
-echo "=== AstraFlow v2 (Llama-3.2-3B-Instruct, math, M2PO, ctx8k, TCP) ==="
+echo "=== AstraFlow v2 (Llama-3.2-3B-Instruct, math, M2PO, ctx16k, TCP) ==="
 echo "Experiment config   : ${EXPERIMENT_CONFIG}"
 echo "RaaS config         : ${RAAS_CONFIG}"
 echo "RaaS GPUs           : ${SERVICE_CUDA_VISIBLE_DEVICES}"

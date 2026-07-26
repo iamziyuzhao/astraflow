@@ -127,8 +127,8 @@ trainer_base:
     gradient_checkpointing: true
     mb_spec:
       # Longest packed sequence is prompt(<=2000) + gen(<=6000) = 8000 tokens,
-      # which fits in one 8192-token microbatch.
-      max_tokens_per_mb: 8192
+      # well inside one 20240-token microbatch.
+      max_tokens_per_mb: 20240
     optimizer:
       type: adam
       lr: 5e-6
@@ -153,7 +153,7 @@ trainer_base:
   ref:
     attn_impl: kernels-community/flash-attn2
     mb_spec:
-      max_tokens_per_mb: 8192
+      max_tokens_per_mb: 20240
 
   recover:
     mode: auto
@@ -166,6 +166,7 @@ trainer_base:
   stats_logger:
     wandb:
       mode: online
+      project: astraflow-math-llama
       id_suffix: "uid"
 
 # ── Trainer for model0 — only overrides ──
