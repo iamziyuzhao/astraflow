@@ -50,7 +50,16 @@ sglang:
   # R3 capture on the server. Keep speculative decoding / hierarchical
   # cache / PD disaggregation off (defaults) — see raas.yaml.
   enable_return_routed_experts: true
+  # REQUIRED on sm_100. The R3 capture hook lives in select_experts
+  # (_post_process_topk_ids), but TopK.forward_cuda short-circuits to
+  # BypassedTopKOutput for flashinfer_trtllm — which is exactly what
+  # "auto" picks on Blackwell — so nothing is captured and the server
+  # still starts, allocates the capturer and reports healthy. "triton"
+  # keeps the standard top-k path. Verified on a B200: with "auto" the
+  # capture probe got no routed experts; with "triton" it passed
+  # (rows == seq_len-1, ids in range, greedy rerun bit-identical).
+  moe_runner_backend: triton
   # B200 (sm_100) note: leave attention_backend unset so sglang
-  # auto-selects for the arch; run a single /generate smoke test on this
-  # node before trusting the full pipeline (the sm_100 kernel path is
-  # newer than the validated sm_90 one).
+  # auto-selects for the arch. FlashInfer autotune hung for >12 min on
+  # the validation node; pass --disable-flashinfer-autotune if startup
+  # stalls after "Running FlashInfer autotune".

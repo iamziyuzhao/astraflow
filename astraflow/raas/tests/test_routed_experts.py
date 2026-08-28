@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import astraflow.raas.api.cli_args as cli_args_module
 import astraflow.raas.engine.remote_inf_engine as remote_inf_engine_mod
 from astraflow.raas.api.cli_args import (
     GenerationHyperparameters,
@@ -686,3 +687,78 @@ class TestChunkedPrefillPolicy:
         )
         args = SGLangConfig.build_args(sglang_config=config, tp_size=1, base_gpu_id=0)
         assert args["chunked_prefill_size"] == 32768
+
+
+class TestMoeRunnerBackendGuard:
+    """The capture hook lives in select_experts; some MoE backends skip it.
+
+    Verified on a B200: with sm_100's "auto" choice the probe received no
+    routed experts at all, while moe_runner_backend="triton" passed.
+    """
+
+    @pytest.mark.parametrize(
+        "backend",
+        [
+            "flashinfer_trtllm",
+            "experimental_sgl_trtllm",
+            "flashinfer_mxfp4",
+            "triton_kernel",
+        ],
+    )
+    def test_bypassing_backend_rejected(self, backend):
+        pytest.importorskip("sglang")
+        config = SGLangConfig(
+            model_path="dummy-model",
+            enable_return_routed_experts=True,
+            moe_runner_backend=backend,
+        )
+        with pytest.raises(ValueError, match="bypasses select_experts"):
+            SGLangConfig.build_args(sglang_config=config, tp_size=1, base_gpu_id=0)
+
+    def test_capturing_backend_accepted(self):
+        pytest.importorskip("sglang")
+        config = SGLangConfig(
+            model_path="dummy-model",
+            enable_return_routed_experts=True,
+            moe_runner_backend="triton",
+        )
+        args = SGLangConfig.build_args(sglang_config=config, tp_size=1, base_gpu_id=0)
+        assert args["moe_runner_backend"] == "triton"
+
+    def test_bypassing_backend_allowed_without_r3(self):
+        pytest.importorskip("sglang")
+        config = SGLangConfig(
+            model_path="dummy-model", moe_runner_backend="flashinfer_trtllm"
+        )
+        args = SGLangConfig.build_args(sglang_config=config, tp_size=1, base_gpu_id=0)
+        assert args["moe_runner_backend"] == "flashinfer_trtllm"
+
+    def test_auto_rejected_on_blackwell(self, monkeypatch):
+        pytest.importorskip("sglang")
+        monkeypatch.setattr(
+            cli_args_module, "_local_device_capability", lambda: (10, 0)
+        )
+        config = SGLangConfig(
+            model_path="dummy-model", enable_return_routed_experts=True
+        )
+        with pytest.raises(ValueError, match="explicit moe_runner_backend"):
+            SGLangConfig.build_args(sglang_config=config, tp_size=1, base_gpu_id=0)
+
+    def test_auto_accepted_on_hopper(self, monkeypatch):
+        pytest.importorskip("sglang")
+        monkeypatch.setattr(cli_args_module, "_local_device_capability", lambda: (9, 0))
+        config = SGLangConfig(
+            model_path="dummy-model", enable_return_routed_experts=True
+        )
+        args = SGLangConfig.build_args(sglang_config=config, tp_size=1, base_gpu_id=0)
+        assert args["enable_return_routed_experts"] is True
+
+    def test_auto_accepted_when_capability_unknown(self, monkeypatch):
+        """Config validation also runs on GPU-less hosts; don't fail there."""
+        pytest.importorskip("sglang")
+        monkeypatch.setattr(cli_args_module, "_local_device_capability", lambda: None)
+        config = SGLangConfig(
+            model_path="dummy-model", enable_return_routed_experts=True
+        )
+        args = SGLangConfig.build_args(sglang_config=config, tp_size=1, base_gpu_id=0)
+        assert args["enable_return_routed_experts"] is True

@@ -20,6 +20,36 @@ logger = logging.getLogger("CLI args")
 
 ConfigT = TypeVar("ConfigT")
 
+# MoE runner backends whose TopK.forward_cuda short-circuits to
+# BypassedTopKOutput / TritonKernelTopKOutput instead of calling
+# select_experts. The R3 capture hook sits inside select_experts
+# (_post_process_topk_ids), so these record nothing at all — silently.
+_MOE_BACKENDS_WITHOUT_CAPTURE = frozenset(
+    {
+        "flashinfer_trtllm",
+        "experimental_sgl_trtllm",
+        "flashinfer_mxfp4",
+        "triton_kernel",
+    }
+)
+
+
+def _local_device_capability() -> tuple[int, int] | None:
+    """CUDA capability of the local device, or None if it cannot be read.
+
+    Config validation also runs on hosts without a visible GPU (tests, dry
+    runs), where refusing to launch would be wrong — so an unknown capability
+    is not treated as a failure.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_capability()
+    except Exception:  # noqa: BLE001 - capability probing must never be fatal
+        return None
+
 
 @dataclass
 class GenerationHyperparameters:
@@ -409,6 +439,11 @@ class SGLangConfig:
     # indices on the server so requests with `return_routed_experts`
     # receive them. Requires sglang>=0.5.13.
     enable_return_routed_experts: bool = False
+    # SGLang MoE runner backend. None leaves SGLang's own default ("auto").
+    # Must be set explicitly to a capturing backend (e.g. "triton") when
+    # enable_return_routed_experts is on and the GPU is sm_100 or newer,
+    # where "auto" resolves to a backend that skips the capture hook.
+    moe_runner_backend: str | None = None
 
     # Use staticmethod to make OmegaConf happy.
     @staticmethod
@@ -542,6 +577,36 @@ class SGLangConfig:
                     "instance never captured, yielding silently stale "
                     "routed-expert rows."
                 )
+            # The capture hook lives in _post_process_topk_ids, which only
+            # select_experts reaches. TopK.forward_cuda short-circuits to
+            # BypassedTopKOutput / TritonKernelTopKOutput for the backends
+            # below, so select_experts never runs and NOTHING is captured —
+            # the server still starts, allocates the capturer, and reports
+            # healthy. Verified on a B200: with the sm_100 default the probe
+            # got no routed_experts at all; with "triton" it passed.
+            moe_runner_backend = args.get("moe_runner_backend") or "auto"
+            if moe_runner_backend in _MOE_BACKENDS_WITHOUT_CAPTURE:
+                raise ValueError(
+                    "enable_return_routed_experts is incompatible with "
+                    f"moe_runner_backend={moe_runner_backend!r}: that backend "
+                    "bypasses select_experts, so no routing is ever recorded "
+                    "and the failure is silent. Use a backend that keeps the "
+                    'standard top-k path, e.g. "triton".'
+                )
+            if moe_runner_backend == "auto":
+                # "auto" resolves per-architecture: sm_90 picks a capturing
+                # backend, but sm_100 (Blackwell) picks flashinfer_trtllm,
+                # which does not capture. Refuse to guess.
+                capability = _local_device_capability()
+                if capability is not None and capability >= (10, 0):
+                    raise ValueError(
+                        "enable_return_routed_experts requires an explicit "
+                        "moe_runner_backend on sm_"
+                        f"{capability[0]}{capability[1]} GPUs: "
+                        '"auto" resolves to flashinfer_trtllm there, which '
+                        "bypasses select_experts and captures nothing. Set "
+                        'moe_runner_backend: "triton".'
+                    )
             # The capturer's device buffer is sized from
             # ``max(chunked_prefill_size, max_running_requests) * dp_size``
             # (sglang/srt/state_capturer/routed_experts.py), while a single
@@ -917,7 +982,9 @@ class RaaSConfig:
     seed: int = field(default=1, metadata={"help": "Random seed."})
     allocation_mode: Any = field(
         default="",
-        metadata={"help": "Engine allocation config. Dict (engine section) or string (legacy)."},
+        metadata={
+            "help": "Engine allocation config. Dict (engine section) or string (legacy)."
+        },
     )
     cluster: ClusterSpecConfig = field(
         default_factory=ClusterSpecConfig,
