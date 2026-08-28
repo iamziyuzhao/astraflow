@@ -109,8 +109,7 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                 self.critic.set_version(version)
             if self._is_rank0:
                 logger.info(
-                    "Recovery: pushing recovered weights to RaaS "
-                    "(version=%d)",
+                    "Recovery: pushing recovered weights to RaaS (version=%d)",
                     version,
                 )
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -145,9 +144,14 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
             # notify_version triggers notify_all_versions to pull weights.
             # Drain the delta/no_delta message left by the initial offload
             # so it doesn't shift the queue for subsequent steps.
-            # Use 180s timeout: first delta after recovery compares against
-            # uninitialized buffer and can take ~85s for a 4B model.
-            self.weight_manager.wait_delta_ready(timeout=180.0)
+            # First delta after recovery compares against an uninitialized
+            # buffer and can take ~85s for a 4B model; large MoE models
+            # (e.g. 30B-A3B) need headroom for the ~61 GB sweep.
+            from astraflow.core.weight_manager.weight_manager import (
+                WEIGHT_SYNC_TIMEOUT_SEC,
+            )
+
+            self.weight_manager.wait_delta_ready(timeout=WEIGHT_SYNC_TIMEOUT_SEC)
 
         # Signal readiness — AstraFlow starts data acquisition only
         # after both RaaS and trainer are ready.
@@ -168,6 +172,7 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
     @property
     def _is_megatron(self) -> bool:
         from astraflow.train_worker.engine.megatron_engine import MegatronEngine
+
         return isinstance(self.actor, MegatronEngine)
 
     def _get_named_params_for_offload(self):
@@ -204,7 +209,12 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
         global_rank = dist.get_rank() if dist.is_initialized() else 0
 
         handshake_port = int(os.getenv("WEIGHT_TRANSFER_HANDSHAKE_PORT", "21000"))
-        http_port = int(os.getenv("WEIGHT_TRANSFER_HTTP_PORT", os.getenv("WEIGHT_TRANSFER_RPYC_PORT", "18861")))
+        http_port = int(
+            os.getenv(
+                "WEIGHT_TRANSFER_HTTP_PORT",
+                os.getenv("WEIGHT_TRANSFER_RPYC_PORT", "18861"),
+            )
+        )
 
         # The sender subprocess (spawn-child of local_rank 0) redirects its
         # stdout/stderr onto this path so fatal-signal tracebacks survive
@@ -269,7 +279,10 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
 
         # Determine HSDP replica rank (0 = primary, >0 = secondary).
         dp_replicate_rank = 0
-        if hasattr(self.actor, 'world_mesh') and "dp_replicate" in self.actor.world_mesh.mesh_dim_names:
+        if (
+            hasattr(self.actor, "world_mesh")
+            and "dp_replicate" in self.actor.world_mesh.mesh_dim_names
+        ):
             dp_replicate_rank = self.actor.world_mesh["dp_replicate"].get_local_rank()
 
         if self.config.actor.use_lora:
@@ -278,11 +291,23 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
             from peft import get_peft_model_state_dict
 
             raw_state = dict(self.actor.model.named_parameters())
-            lora_params = get_peft_model_state_dict(self.actor.model, state_dict=raw_state)
-            logger.info("[DEBUG-INIT] raw_state keys (%d): %s", len(raw_state), list(raw_state.keys())[:10])
-            logger.info("[DEBUG-INIT] lora_params keys (%d): %s", len(lora_params), list(lora_params.keys())[:10])
+            lora_params = get_peft_model_state_dict(
+                self.actor.model, state_dict=raw_state
+            )
+            logger.info(
+                "[DEBUG-INIT] raw_state keys (%d): %s",
+                len(raw_state),
+                list(raw_state.keys())[:10],
+            )
+            logger.info(
+                "[DEBUG-INIT] lora_params keys (%d): %s",
+                len(lora_params),
+                list(lora_params.keys())[:10],
+            )
             self.weight_manager.initialize(
-                lora_params.items(), local_rank, global_rank,
+                lora_params.items(),
+                local_rank,
+                global_rank,
                 lora_config=lora_config,
                 dp_replicate_rank=dp_replicate_rank,
             )
@@ -290,11 +315,12 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
             # In Megatron HF-export mode the layout comes from
             # megatron_hf_meta, so named_params is unused at init time.
             named_params = (
-                iter(()) if self._is_megatron
-                else self._get_named_params_for_offload()
+                iter(()) if self._is_megatron else self._get_named_params_for_offload()
             )
             self.weight_manager.initialize(
-                named_params, local_rank, global_rank,
+                named_params,
+                local_rank,
+                global_rank,
                 megatron_hf_meta=megatron_hf_meta,
                 dp_replicate_rank=dp_replicate_rank,
             )
@@ -387,7 +413,8 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
         buffer_stats: dict[str, float] = {}
         if self._is_rank0:
             batch, buffer_stats = self.astraflow.get_batch(
-                timeout=timeout, version=version,
+                timeout=timeout,
+                version=version,
             )
             # Compute batch reward mean before any transformation.
             batch_rewards = batch.get("rewards")
@@ -404,7 +431,9 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
 
         # Broadcast skip-flag so all ranks agree on whether to skip the step.
         skip_flag = torch.zeros(
-            1, dtype=torch.int32, device=current_platform.current_device(),
+            1,
+            dtype=torch.int32,
+            device=current_platform.current_device(),
         )
         if self._is_rank0 and batch is None:
             skip_flag.fill_(1)
@@ -577,7 +606,8 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                     with stats_tracker.record_timing("eval"):
                         try:
                             pre_eval_results = self.astraflow.notify_version(
-                                version=0, run_eval=True,
+                                version=0,
+                                run_eval=True,
                             )
                         except Exception as e:
                             logger.warning(
@@ -692,15 +722,23 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                                 self.weight_manager.offload(
                                     state_dict.items(),
                                     version=new_version,
-                                    rank=dist.get_rank() if dist.is_initialized() else 0,
-                                    world_size=dist.get_world_size() if dist.is_initialized() else 1,
+                                    rank=dist.get_rank()
+                                    if dist.is_initialized()
+                                    else 0,
+                                    world_size=dist.get_world_size()
+                                    if dist.is_initialized()
+                                    else 1,
                                 )
                             else:
                                 self.weight_manager.offload(
                                     self._get_named_params_for_offload(),
                                     version=new_version,
-                                    rank=dist.get_rank() if dist.is_initialized() else 0,
-                                    world_size=dist.get_world_size() if dist.is_initialized() else 1,
+                                    rank=dist.get_rank()
+                                    if dist.is_initialized()
+                                    else 0,
+                                    world_size=dist.get_world_size()
+                                    if dist.is_initialized()
+                                    else 1,
                                 )
                         if self._is_rank0:
                             print(
@@ -734,7 +772,8 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                                     "[step %d] (skip) notify_version_async "
                                     "failed: %s — continuing (RaaS will catch "
                                     "up on next bump)",
-                                    global_step, e,
+                                    global_step,
+                                    e,
                                 )
 
                         dist.barrier(group=self.actor.cpu_group)
@@ -861,25 +900,41 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                                 StateDictOptions,
                             )
 
-                            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                            state_dict = get_model_state_dict(self.actor.model, options=options)
-                            logger.info("[DEBUG-OFFLOAD] full state_dict keys (%d): %s", len(state_dict), list(state_dict.keys())[:10])
+                            options = StateDictOptions(
+                                full_state_dict=True, cpu_offload=True
+                            )
+                            state_dict = get_model_state_dict(
+                                self.actor.model, options=options
+                            )
+                            logger.info(
+                                "[DEBUG-OFFLOAD] full state_dict keys (%d): %s",
+                                len(state_dict),
+                                list(state_dict.keys())[:10],
+                            )
                             state_dict = get_peft_model_state_dict(
                                 self.actor.model, state_dict=state_dict
                             )
-                            logger.info("[DEBUG-OFFLOAD] after peft filter keys (%d): %s", len(state_dict), list(state_dict.keys())[:10])
+                            logger.info(
+                                "[DEBUG-OFFLOAD] after peft filter keys (%d): %s",
+                                len(state_dict),
+                                list(state_dict.keys())[:10],
+                            )
                             wt_metrics = self.weight_manager.offload(
                                 state_dict.items(),
                                 version=new_version,
                                 rank=dist.get_rank() if dist.is_initialized() else 0,
-                                world_size=dist.get_world_size() if dist.is_initialized() else 1,
+                                world_size=dist.get_world_size()
+                                if dist.is_initialized()
+                                else 1,
                             )
                         else:
                             wt_metrics = self.weight_manager.offload(
                                 self._get_named_params_for_offload(),
                                 version=new_version,
                                 rank=dist.get_rank() if dist.is_initialized() else 0,
-                                world_size=dist.get_world_size() if dist.is_initialized() else 1,
+                                world_size=dist.get_world_size()
+                                if dist.is_initialized()
+                                else 1,
                             )
                     if self._is_rank0:
                         print(
@@ -896,7 +951,10 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                     # Step 5: Save buffer + checkpoint
                     _save_t0 = time.monotonic()
                     if self._is_rank0:
-                        print(f"[Trainer] [step {global_step}] Saving checkpoint ...", flush=True)
+                        print(
+                            f"[Trainer] [step {global_step}] Saving checkpoint ...",
+                            flush=True,
+                        )
                     with (
                         stats_tracker.record_timing("save"),
                         perf_tracer.trace_scope(
@@ -944,7 +1002,8 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                         # was actually written (same freq_steps gate).
                         if (
                             self._is_rank0
-                            and self.recover_handler.last_saved_global_step != prev_saved_step
+                            and self.recover_handler.last_saved_global_step
+                            != prev_saved_step
                         ):
                             _t_buf = time.monotonic()
                             self.astraflow.save_buffer()
@@ -977,7 +1036,10 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
 
                         # Wait for async delta compute before notifying
                         # (ensures delta is ready when RaaS pulls).
-                        if hasattr(self, "weight_manager") and self.weight_manager is not None:
+                        if (
+                            hasattr(self, "weight_manager")
+                            and self.weight_manager is not None
+                        ):
                             self.weight_manager.wait_delta_ready()
 
                         if should_eval:
@@ -989,13 +1051,15 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                             with stats_tracker.record_timing("eval"):
                                 try:
                                     eval_results = self.astraflow.notify_version(
-                                        version=version, run_eval=True,
+                                        version=version,
+                                        run_eval=True,
                                     )
                                 except Exception as e:
                                     logger.warning(
                                         "[step %d] notify_version (sync, eval) "
                                         "failed: %s — skipping eval, continuing",
-                                        global_step, e,
+                                        global_step,
+                                        e,
                                     )
                                     eval_results = None
                             print(
@@ -1017,7 +1081,8 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                                 logger.warning(
                                     "[step %d] notify_version_async failed: %s — "
                                     "continuing (RaaS will catch up on next bump)",
-                                    global_step, e,
+                                    global_step,
+                                    e,
                                 )
                             print(
                                 f"[Trainer] [step {global_step}] AstraFlow version "
@@ -1099,7 +1164,11 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                                     )
                                 pass_at_k = ds.get("pass@k")
                                 pass_k = ds.get("pass_k")
-                                if pass_at_k is not None and pass_k is not None and int(pass_k) > 1:
+                                if (
+                                    pass_at_k is not None
+                                    and pass_k is not None
+                                    and int(pass_k) > 1
+                                ):
                                     with stats_tracker.scope(f"eval-pass/{name}"):
                                         stats_tracker.scalar(
                                             **{f"pass@{int(pass_k)}": pass_at_k},
@@ -1117,7 +1186,11 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
                                     )
                                     with stats_tracker.scope("eval-pass"):
                                         stats_tracker.scalar(
-                                            **{metric_name: eval_results["overall_pass@k"]},
+                                            **{
+                                                metric_name: eval_results[
+                                                    "overall_pass@k"
+                                                ]
+                                            },
                                         )
 
                     with perf_tracer.trace_scope(
@@ -1137,6 +1210,7 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
             self._completed_normally = True
         except Exception as _exc:
             import traceback
+
             print(f"[Trainer] EXCEPTION in training loop: {_exc}", flush=True)
             traceback.print_exc()
             raise
@@ -1189,12 +1263,14 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
         # Kill child processes (e.g. sender_agent) that would otherwise
         # become orphans and hold ports.
         import multiprocessing
+
         for child in multiprocessing.active_children():
             child.kill()
 
         # Hard-exit: avoids hanging on NCCL cleanup in actor.destroy()
         # and prevents torchrun from misinterpreting the exit.
         import os as _os
+
         _os._exit(0)
 
     def close(self):

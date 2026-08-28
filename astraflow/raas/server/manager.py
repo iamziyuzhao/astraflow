@@ -16,6 +16,7 @@ from astraflow.raas.engine.vllm_remote import VLLMEngine
 from astraflow.raas.platforms import current_platform
 from astraflow.raas.utils import logging
 from astraflow.raas.utils.network import find_free_ports, gethostip
+from astraflow.core.weight_manager.weight_manager import WEIGHT_SYNC_TIMEOUT_SEC
 from astraflow.core.workflow.api.engine_api import EngineGroup
 from astraflow.core.workflow.registry import get_reward, get_workflow
 
@@ -1305,11 +1306,14 @@ class RaaS3Manager:
     # in ~50s.
     _HEALTH_MONITOR_MAX_FAILURES = 5  # consecutive failures before exit
     # Maximum time a weight update is allowed to legitimately stall the
-    # engine before the monitor force-probes anyway. A normal full pull +
-    # apply + load runs ~60-70s end-to-end, deltas ~30-40s; 90s is a
-    # generous upper bound — anything beyond it suggests the workers
-    # died silently mid-update and the flag will never clear.
-    _WEIGHT_UPDATE_GRACE_SEC = 90.0
+    # engine before the monitor force-probes anyway. For dense ~8B models
+    # a full pull + apply + load runs ~60-70s end-to-end (deltas ~30-40s),
+    # but large MoE models are an order of magnitude bigger on the wire,
+    # so this shares the single trainer-side budget rather than carrying
+    # its own literal — see WEIGHT_SYNC_TIMEOUT_SEC in
+    # astraflow/core/weight_manager/weight_manager.py for the sizing
+    # rationale and the full list of call sites.
+    _WEIGHT_UPDATE_GRACE_SEC = WEIGHT_SYNC_TIMEOUT_SEC
 
     async def _engine_health_monitor(self) -> None:
         """Periodically check SGLang engine health. Exit process if dead.

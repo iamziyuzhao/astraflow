@@ -34,6 +34,25 @@ from astraflow.core.weight_manager.transfer.sender_agent import (
 
 logger = logging.getLogger(__name__)
 
+# Single source of truth for the weight-sync stall budget, in seconds.
+#
+# Sized for a large-MoE *full-weight* sweep: Qwen3-30B-A3B is ~61 GB of HF
+# bytes across ~18.9k expert tensors, and one pull + apply + load — possibly
+# cross-node — legitimately takes several minutes.  Dense ~8B models finish
+# the same leg in ~60-70s (deltas ~30-40s) and never come close, so the
+# window is slack for them rather than a real detection delay; the bounded
+# consecutive-expiry escalation below is what keeps a dead sender agent from
+# stalling a dense run forever.
+#
+# Referenced by (do NOT re-literal 300.0 anywhere):
+#   - WeightManager._BUFFER_READY_ACK_TIMEOUT_SEC (below)
+#   - WeightManager.wait_delta_ready() default (below)
+#   - RaaS3Manager._WEIGHT_UPDATE_GRACE_SEC  (astraflow/raas/server/manager.py)
+# TODO(agent): astraflow/train_worker/trainer/ppo_trainer.py still passes a
+# literal 300.0 to wait_delta_ready(); that call site is owned elsewhere and
+# should import WEIGHT_SYNC_TIMEOUT_SEC from this module instead.
+WEIGHT_SYNC_TIMEOUT_SEC = 300.0
+
 _DTYPE_SIZES = {
     "float32": 4, "float16": 2, "bfloat16": 2,
     "int64": 8, "int32": 4, "int16": 2, "int8": 1, "uint8": 1,
@@ -46,6 +65,35 @@ def _nbytes(shape: List[int], dtype: str) -> int:
     return int(prod(shape)) * _DTYPE_SIZES.get(dtype, 2)
 
 
+def _detect_num_moe_experts(megatron_metadata: dict) -> int:
+    """Best-effort read of the MoE expert count from legacy Megatron metadata.
+
+    Checks the metadata dict itself and its ``conversion_config`` entry
+    (either a plain dict or a config object) for the Megatron
+    (``num_moe_experts``) and HF (``num_experts`` / ``num_local_experts`` /
+    ``n_routed_experts``) spellings. Returns 0 when the model is dense or
+    the count cannot be determined.
+    """
+    keys = (
+        "num_moe_experts",
+        "num_experts",
+        "num_local_experts",
+        "n_routed_experts",
+    )
+    sources = [megatron_metadata, megatron_metadata.get("conversion_config")]
+    for src in sources:
+        if src is None:
+            continue
+        for key in keys:
+            if isinstance(src, dict):
+                value = src.get(key)
+            else:
+                value = getattr(src, key, None)
+            if value:
+                return int(value)
+    return 0
+
+
 class WeightManager:
     """Single owner of all weight transfer state and logic.
 
@@ -56,6 +104,19 @@ class WeightManager:
     - Sender agent subprocess lifecycle
     - Delta computation is done by the sender agent on CPU
     """
+
+    # How long to wait for the sender agent's buffer_ready ack. The ack
+    # itself is just an index swap, but on large-MoE syncs the agent can be
+    # busy finishing the previous version's delta/serve work for minutes,
+    # so the old 60s produced spurious timeouts. See WEIGHT_SYNC_TIMEOUT_SEC.
+    _BUFFER_READY_ACK_TIMEOUT_SEC = WEIGHT_SYNC_TIMEOUT_SEC
+
+    # A missed ack means the buffer half was never swapped, so the next
+    # offload overwrites weights the sender may still be reading. One miss
+    # can be a slow-but-alive agent; this many in a row means it is gone,
+    # and warning forever would let the trainer burn ~5 min/step producing
+    # versions RaaS will never receive. Escalate to a hard failure instead.
+    _MAX_CONSECUTIVE_ACK_TIMEOUTS = 3
 
     def __init__(self, config: WeightManagerConfig):
         self.config = config
@@ -77,6 +138,8 @@ class WeightManager:
         self._delta_done_event: mp.Event | None = None
         # Last delta metrics stashed by sender agent (retrieved after wait)
         self._last_delta_metrics: dict | None = None
+        # Consecutive buffer_ready ack timeouts; reset on every ack.
+        self._consecutive_ack_timeouts: int = 0
 
         # Initialization state
         self._local_rank: int = 0
@@ -149,6 +212,18 @@ class WeightManager:
             ]
             tensors_meta = list(megatron_hf_meta)
         elif megatron_metadata is not None:
+            num_moe_experts = _detect_num_moe_experts(megatron_metadata)
+            if num_moe_experts > 0:
+                raise ValueError(
+                    "Legacy megatron_metadata shard-direct weight transfer "
+                    f"does not support MoE models (num_moe_experts="
+                    f"{num_moe_experts}): the sender-side TP reassembly only "
+                    "understands dense sharding and would silently corrupt "
+                    "expert weights. Use the mbridge HF-export path instead: "
+                    "pass megatron_hf_meta (the ordered HF weight layout from "
+                    "hf_weight_metadata / export_hf_named_params) and leave "
+                    "megatron_metadata unset."
+                )
             meta_size, tensors_meta = self._compute_megatron_buffer_layout(
                 megatron_metadata["shard_specs"]
             )
@@ -740,16 +815,37 @@ class WeightManager:
             self._input_queue.put(f"buffer_ready:{version}:{buf_idx}")
             try:
                 # Sender acks immediately after swap (no delta wait)
-                ack = self._output_queue.get(timeout=60.0)
+                ack = self._output_queue.get(timeout=self._BUFFER_READY_ACK_TIMEOUT_SEC)
+                self._consecutive_ack_timeouts = 0
                 if isinstance(ack, str) and ack.startswith("error:"):
                     logger.error(
                         "[WeightManager] Sender agent error: %s", ack[6:],
                     )
                     ack = None
             except queue.Empty:
+                self._consecutive_ack_timeouts += 1
+                if (
+                    self._consecutive_ack_timeouts
+                    >= self._MAX_CONSECUTIVE_ACK_TIMEOUTS
+                ):
+                    raise RuntimeError(
+                        "[WeightManager] Sender agent did not acknowledge "
+                        f"buffer_ready within "
+                        f"{self._BUFFER_READY_ACK_TIMEOUT_SEC:.0f}s on "
+                        f"{self._consecutive_ack_timeouts} consecutive "
+                        f"versions (limit "
+                        f"{self._MAX_CONSECUTIVE_ACK_TIMEOUTS}) — the agent "
+                        "is presumed dead. Every version since the first "
+                        "miss was written into a buffer half that was never "
+                        "swapped, so RaaS is not receiving weights; failing "
+                        "instead of stalling the trainer indefinitely."
+                    ) from None
                 logger.warning(
                     "[WeightManager] Sender agent did not acknowledge "
-                    "buffer_ready within 60s"
+                    "buffer_ready within %.0fs (%d/%d consecutive)",
+                    self._BUFFER_READY_ACK_TIMEOUT_SEC,
+                    self._consecutive_ack_timeouts,
+                    self._MAX_CONSECUTIVE_ACK_TIMEOUTS,
                 )
         # ALL ranks flip so the next write targets the other half.
         self._inactive_buf_idx = 1 - buf_idx
@@ -776,16 +872,31 @@ class WeightManager:
                 "[WeightManager] Previous delta did not complete within 120s"
             )
 
-    def wait_delta_ready(self, timeout: float = 60.0) -> None:
+    def wait_delta_ready(self, timeout: float = WEIGHT_SYNC_TIMEOUT_SEC) -> None:
         """Wait for async delta compute to finish and stash metrics.
 
         Called by the trainer before ``notify_version`` to ensure delta
         is ready when RaaS pulls.  Also retrieves delta metrics from the
         sender agent's output queue for wandb logging.
+
+        The default is ``WEIGHT_SYNC_TIMEOUT_SEC``, sized for large-MoE
+        syncs: a full-model delta over ~61 GB of HF bytes (Qwen3-30B-A3B)
+        takes minutes on CPU, so the old 60s default fired routinely.
+        Callers passing an explicit timeout should budget similarly for
+        MoE models.
         """
         if self._delta_done_event is None:
             return
-        self._delta_done_event.wait(timeout=timeout)
+        if not self._delta_done_event.wait(timeout=timeout):
+            # Proceeding anyway is deliberate — the trainer must not be
+            # wedged by a slow delta — but this used to be entirely silent,
+            # which made "RaaS pulled a half-written delta" undiagnosable.
+            logger.warning(
+                "[WeightManager] Delta compute did not finish within %.0fs; "
+                "continuing to notify_version — RaaS may pull a stale or "
+                "incomplete delta for this version",
+                timeout,
+            )
         # Read the delta message the sender put on the queue before setting
         # the event.  Use a blocking get() instead of empty() + get_nowait()
         # because mp.Queue.empty() is unreliable across processes.

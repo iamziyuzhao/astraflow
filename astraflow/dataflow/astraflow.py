@@ -56,6 +56,8 @@ class AstraFlow:
         per_model_buffer_config: dict[str, dict] | None = None,
         curator: Any = None,
         curator_args: dict[str, Any] | None = None,
+        max_collect_per_tick: int | None = None,
+        collect_timeout: float | None = None,
     ):
         """Initialize AstraFlow with acquisition and serving components."""
         self.rollout = rollout
@@ -78,6 +80,15 @@ class AstraFlow:
         self.data_serving = data_serving
 
         if data_acquisition is None:
+            # Collect-tick knobs are omitted unless explicitly configured so
+            # AstraDataAcquisition keeps sole ownership of the defaults —
+            # a run that does not set them behaves exactly as before.
+            collect_kwargs: dict[str, Any] = {}
+            if max_collect_per_tick is not None:
+                collect_kwargs["max_collect_per_tick"] = int(max_collect_per_tick)
+            if collect_timeout is not None:
+                collect_kwargs["collect_timeout"] = float(collect_timeout)
+
             data_acquisition = AstraDataAcquisition(
                 rollout=rollout,
                 rollout_dataloader=rollout_dataloader,
@@ -89,6 +100,7 @@ class AstraFlow:
                 data_serving=self.data_serving,
                 debug=buffer_debug,
                 error_backoff=producer_error_backoff,
+                **collect_kwargs,
             )
         self.data_acquisition = data_acquisition
 

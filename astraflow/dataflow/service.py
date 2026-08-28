@@ -51,6 +51,7 @@ class AstraFlowService:
             heartbeat_interval=config.heartbeat_interval,
             heartbeat_max_failures=config.heartbeat_max_failures,
             raas_initialize_timeout=config.raas_initialize_timeout,
+            pull_timeout=config.agent.raas_pull_timeout,
         )
         self.agent_configs: dict[str, AgentConfig] = {}
         self.versions: dict[str, int] = {}
@@ -183,6 +184,8 @@ class AstraFlowService:
             expected_model_ids=agent_config.expected_model_ids,
             curator=agent_config.curator,
             curator_args=agent_config.curator_args,
+            max_collect_per_tick=agent_config.max_collect_per_tick,
+            collect_timeout=agent_config.collect_timeout,
         )
         self.flows[agent_name] = flow
 

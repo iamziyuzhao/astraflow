@@ -130,6 +130,52 @@ class AgentConfig:
     curator_args: dict[str, Any] = field(default_factory=dict)
     """Constructor kwargs for the curator named in ``curator``."""
 
+    # --- Rollout collect tuning -------------------------------------
+    # These reach the collect path the same way every other field in this
+    # dataclass does: a same-named key under the ``dataflow:`` section of
+    # the experiment YAML is copied onto AgentConfig by
+    # ``load_dataflow_config`` + ``astraflow.dataflow.__main__._parse_config``,
+    # and ``AstraFlowService`` forwards it to the constructor below.
+
+    raas_pull_timeout: float | None = None
+    """HTTP read timeout (seconds) for the RaaS collect path (``/pull``).
+
+    Forwarded by ``AstraFlowService`` to every ``RaaS2InferenceEngine``
+    the global ``RaaSPool`` creates, and used by the pool to size the
+    future timeout that wraps each per-instance pull.  ``None`` (default)
+    keeps the historical behavior of sharing the engine's general
+    ``request_timeout`` (10s).
+
+    Raise this for Rollout Routing Replay (R3) runs: with
+    ``return_routed_experts`` enabled a single sequence carries an extra
+    ``n_moe_layers x top_k x int16`` block per token (~3 MB/sequence for
+    Qwen3-30B-A3B at 4096 tokens), so one collect tick can move hundreds
+    of MB and a 10s read timeout is not enough.
+
+    Note this is a *service*-scoped knob even though it lives on
+    ``AgentConfig``: the ``RaaSPool`` is global.  It sits here because the
+    ``dataflow:`` YAML section maps onto ``AgentConfig`` — ``ServiceConfig``
+    fields have no generic YAML path.
+    """
+
+    max_collect_per_tick: int | None = None
+    """Maximum results requested from RaaS per collect tick.
+
+    Lower this alongside ``raas_pull_timeout`` for R3 runs so one tick's
+    response stays a manageable size.  ``None`` (default) leaves the knob
+    unset, so ``AstraDataAcquisition`` keeps sole ownership of the default
+    (512) — deliberately *not* restated here, so the two cannot drift.
+    """
+
+    collect_timeout: float | None = None
+    """Server-side long-poll timeout (seconds) per collect tick.
+
+    This is the ``timeout`` argument passed to ``pull_completed`` — how
+    long RaaS waits for new completions before returning an empty list —
+    *not* the HTTP read timeout (that is ``raas_pull_timeout``).  ``None``
+    (default) leaves ``AstraDataAcquisition``'s default (0.1s) in force.
+    """
+
 
 @dataclass
 class EvalConfig:

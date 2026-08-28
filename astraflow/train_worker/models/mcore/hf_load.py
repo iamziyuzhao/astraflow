@@ -11,10 +11,19 @@ from mbridge.core.bridge import Bridge
 from megatron.core import parallel_state as mpu
 from safetensors import safe_open
 
+from astraflow.train_worker.models.mcore.mbridge_compat import (
+    apply_mbridge_compat_patches,
+)
 from astraflow.train_worker.models.mcore.registry import unwrap_to_gpt_model
 from astraflow.train_worker.utils import logging
 
 logger = logging.getLogger("HF WeightsLoader")
+
+# transformers 5.x removed hf_config.rope_theta; patch mbridge before any
+# bridge is constructed. The Megatron engine imports this module at import
+# time, well before AutoBridge.from_pretrained builds a model, so applying
+# the (idempotent) patch here guarantees the ordering.
+apply_mbridge_compat_patches()
 
 
 def _get_tp_slice(shape, dim, tp_rank, tp_size) -> tuple:
