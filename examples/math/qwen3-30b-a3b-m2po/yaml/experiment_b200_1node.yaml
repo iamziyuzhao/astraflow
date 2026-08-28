@@ -167,7 +167,19 @@ trainer_base:
     reward_scaling: 1
     reward_bias: 0
     kl_ctl: 0.00
-    kl_penalty_coef: 0.001
+    # 0.0, unlike the 6-GPU recipe's 0.001. ppo_base.py materialises a full
+    # second copy of the model as the reference policy whenever
+    # `kl_ctl > 0 or kl_penalty_coef > 0`, which at 30B is another 16.4 GiB
+    # of bf16 parameters per GPU plus its forward -- the single largest
+    # item missing from the first memory estimates, and enough on its own
+    # to push this layout past a 183 GB card.
+    #
+    # NOTE this changes the objective: it drops the KL-to-reference
+    # regulariser. kl_ctl was already 0, so the reference policy only
+    # entered through this 0.001 penalty term, and RLVR recipes commonly
+    # run without one. Restore both (and the `ref:` block below) if the
+    # regulariser is wanted, on hardware with room for two model copies.
+    kl_penalty_coef: 0.0
     ppo_n_minibatches: 4
     reward_norm: { mean_level: group, std_level: group }
     adv_norm: { mean_level: batch, std_level: batch }
@@ -198,9 +210,9 @@ trainer_base:
       # gconfig.return_routed_experts on the rollout side.
       moe_router_replay: true
 
-  ref:
-    mb_spec:
-      max_tokens_per_mb: 4608
+  # No `ref:` block: with kl_ctl and kl_penalty_coef both 0 the reference
+  # policy is never constructed, so configuring it would only reserve
+  # memory for a model that never contributes to the loss.
 
   recover:
     mode: auto
