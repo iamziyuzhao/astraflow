@@ -99,6 +99,12 @@ class GenerationHyperparameters:
             "help": "Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored."
         },
     )
+    return_routed_experts: bool = field(
+        default=False,
+        metadata={
+            "help": "request per-token MoE routed expert indices from the rollout engine (R3); requires an SGLang server launched with enable_return_routed_experts."
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -155,6 +161,7 @@ class GenerationHyperparameters:
         "lora_name",  # Not supported by OpenAI
         "use_beam_search",  # Not supported by OpenAI
         "max_tokens",  # deprecated by "completions", not used in "responses", should be `max_new_tokens` in "openai-agents"
+        "return_routed_experts",  # Not supported by OpenAI
     }
 
     def to_openai_args_dict(
@@ -398,6 +405,10 @@ class SGLangConfig:
     # and passed as `model_loader_extra_config` to SGLang.
     enable_multithread_load: bool = False
     enable_fast_load: bool = False
+    # R3 (Rollout Routing Replay): capture per-token MoE routed expert
+    # indices on the server so requests with `return_routed_experts`
+    # receive them. Requires sglang>=0.5.13.
+    enable_return_routed_experts: bool = False
 
     # Use staticmethod to make OmegaConf happy.
     @staticmethod
@@ -488,6 +499,82 @@ class SGLangConfig:
             raise RuntimeError("Needs sglang>=0.4.9.post2 to run the code.")
         if is_version_less("sglang", "0.4.10.post2"):
             args.pop("max_loaded_loras", None)
+        if sglang_config.enable_return_routed_experts:
+            if not pkg_version.is_version_greater_or_equal("sglang", "0.5.13"):
+                raise RuntimeError(
+                    "enable_return_routed_experts requires sglang>=0.5.13 "
+                    "(native routed-experts capture)."
+                )
+            if args.get("speculative_algorithm") not in (None, "", "none"):
+                raise ValueError(
+                    "enable_return_routed_experts is incompatible with "
+                    "speculative decoding: the SGLang routed-experts capturer "
+                    "does not account for draft/verify tokens."
+                )
+            # Prefix caching of any flavor breaks the capture. The capturer
+            # returns rows read out of the KV slots by index, so a cache hit
+            # hands back rows written by an EARLIER request (routing recorded
+            # under older weights) or arbitrary data if the slot was since
+            # reused. Row counts still telescope correctly, so no downstream
+            # assertion can catch it — refuse to launch instead.
+            if not args.get("disable_radix_cache", True):
+                raise ValueError(
+                    "enable_return_routed_experts is incompatible with the "
+                    "radix/prefix cache: on a prefix-cache hit the capturer "
+                    "returns rows from KV slots written by an earlier request "
+                    "(routing from older weights, or evicted-slot garbage), "
+                    "and the row counts still line up so nothing downstream "
+                    "can detect it. Set disable_radix_cache: true."
+                )
+            if args.get("enable_hierarchical_cache"):
+                raise ValueError(
+                    "enable_return_routed_experts is incompatible with "
+                    "enable_hierarchical_cache: KV landed back from the host "
+                    "tier occupies slots that were never captured, yielding "
+                    "silently stale routed-expert rows."
+                )
+            if args.get("disaggregation_mode") not in (None, "", "null"):
+                raise ValueError(
+                    "enable_return_routed_experts is incompatible with PD "
+                    "disaggregation (disaggregation_mode="
+                    f"{args.get('disaggregation_mode')!r}): KV transferred "
+                    "from the prefill instance occupies slots the decode "
+                    "instance never captured, yielding silently stale "
+                    "routed-expert rows."
+                )
+            # The capturer's device buffer is sized from
+            # ``max(chunked_prefill_size, max_running_requests) * dp_size``
+            # (sglang/srt/state_capturer/routed_experts.py), while a single
+            # prefill forward may hold up to max_prefill_tokens tokens. With
+            # chunked prefill disabled (-1/None, AstraFlow's default) the
+            # buffer is sized from max_running_requests alone and the forward
+            # overruns it on long prompts.
+            chunked_prefill_size = args.get("chunked_prefill_size")
+            max_prefill_tokens = sglang_config.max_prefill_tokens
+            if chunked_prefill_size is None or chunked_prefill_size <= 0:
+                # Unset/disabled: no user tuning to preserve, so pair the two.
+                logger.warning(
+                    "enable_return_routed_experts requires chunked prefill to "
+                    "size the capturer buffer; overriding chunked_prefill_size "
+                    "from %s to max_prefill_tokens=%d.",
+                    chunked_prefill_size,
+                    max_prefill_tokens,
+                )
+                args["chunked_prefill_size"] = max_prefill_tokens
+            elif chunked_prefill_size < max_prefill_tokens:
+                # An explicit positive value is a deliberate memory/latency
+                # choice; silently rewriting it would change behavior for all
+                # traffic. Make the operator resolve the conflict.
+                raise ValueError(
+                    "enable_return_routed_experts requires "
+                    f"chunked_prefill_size (={chunked_prefill_size}) >= "
+                    f"max_prefill_tokens (={max_prefill_tokens}) so the "
+                    "routed-experts capturer buffer covers the largest "
+                    "possible prefill forward. Raise chunked_prefill_size to "
+                    f"at least {max_prefill_tokens}, or lower "
+                    "max_prefill_tokens to at most "
+                    f"{chunked_prefill_size}."
+                )
         return args
 
 
