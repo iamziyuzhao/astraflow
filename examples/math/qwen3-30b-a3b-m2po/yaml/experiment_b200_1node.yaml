@@ -27,16 +27,21 @@
 #
 #                            fp32 (OOMs)   with the settings below
 #   bf16 params                 16.4 GiB          16.4 GiB
-#   main_grad buffer            32.7 GiB          16.4 GiB   (bf16)
+#   DDP grad buffer             32.7 GiB          16.4 GiB   (bf16)
 #   fp32 master (shard)         28.4 GiB          28.4 GiB
 #   exp_avg (shard)             28.4 GiB          14.2 GiB   (bf16)
-#   exp_avg_sq (shard)          28.4 GiB          28.4 GiB
+#   exp_avg_sq (shard)          28.4 GiB          14.2 GiB   (bf16)
 #                              ---------         ---------
-#   steady state               134.3 GiB         103.8 GiB
+#   steady state               134.3 GiB          89.6 GiB
 #   + activations, NCCL,
 #     fragmentation (obs.)      ~37   GiB         ~37   GiB
 #                              ---------         ---------
-#                              ~171   GiB        ~141   GiB
+#                              ~171   GiB        ~127   GiB
+#
+# A middle attempt keeping exp_avg_sq and the DDP buffer in fp32 still
+# OOMed at 157.7 GiB allocated -- the DDP gradient buffer is owned by
+# ddp.grad_reduce_in_fp32, not by the optimizer's main_grads_dtype, so
+# setting only the latter saved almost nothing.
 #
 # The "shard" rows are smaller than the full parameter count because the
 # distributed optimizer shards each parameter over ITS OWN data-parallel
@@ -177,7 +182,14 @@ trainer_base:
       main_params_dtype: float32
       main_grads_dtype: bfloat16
       exp_avg_dtype: bfloat16
-      exp_avg_sq_dtype: float32
+      exp_avg_sq_dtype: bfloat16
+      ddp:
+        # Separate knob from main_grads_dtype, and the one that actually
+        # owns the big buffer: main_grads_dtype is the optimizer's view,
+        # while DDP allocates the gradient *accumulation* buffer over the
+        # full 8.789 B params. Leaving it fp32 kept 32.7 GiB resident and
+        # made the first precision-aware attempt save only ~3 GiB.
+        grad_reduce_in_fp32: false
       # Recommended for RL on MoE models: identical inputs must produce
       # identical forwards, and the R3 replay equivalence gate depends on it.
       use_deterministic_algorithms: true
