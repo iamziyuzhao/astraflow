@@ -1,0 +1,56 @@
+# ============================================================================
+# RaaS config — remote 4xB200 rollout node variant
+# Experiment: math / qwen3-30b-a3b-m2po
+#
+# Hardware: 4x B200 (~180 GB each) on a separate node from the trainer.
+#   model0:  DP=4, TP=1  (one full ~61 GB bf16 replica per GPU,
+#                         plenty of KV headroom at ctx 4096)
+#
+# Launch on the B200 node with scripts/2b_raas_b200.sh:
+#   --config experiment.yaml --config raas_b200.yaml
+#
+# Cross-node reachability (verify BEFORE launching):
+#   B200 -> H200 : ASTRAFLOW_PORT (8000), sender HTTP (19861),
+#                  TCP handshake (21000)
+#   H200 -> B200 : RAAS_PORT (19190)
+# Hostnames must resolve in BOTH directions (socket.gethostname() is
+# load-bearing in the weight-transfer handshake); if DNS does not resolve,
+# export the IPs explicitly (ASTRAFLOW_URL on this node, RAAS host on the
+# trainer node).
+#
+# Every weight sync ships the full ~61 GB HF byte buffer across the node
+# link; the raised weight-update grace windows (RaaS
+# _WEIGHT_UPDATE_GRACE_SEC, trainer buffer-ready ack) budget for this.
+# ============================================================================
+
+rollout:
+  # See raas.yaml: bounded for the R3 routed-experts payload, which here
+  # also crosses the node link on every pull tick.
+  max_concurrent_rollouts: 256
+  max_concurrent_evals: 64
+  pause_grace_period: 3
+  enable_adaptive_availability: true
+  target_waiting_queue_per_dp: 4
+  adaptive_step_size: 4
+  load_cache_ttl_ms: 100
+
+engine:
+  model0:
+    backend: sglang
+    data_parallel_size: 4
+
+sglang:
+  context_length: 4096
+  mem_fraction_static: 0.7
+  # REQUIRED with enable_return_routed_experts — see raas.yaml for the
+  # capturer buffer-sizing rationale.
+  chunked_prefill_size: 32768
+  max_running_requests: null
+  skip_tokenizer_init: true
+  # R3 capture on the server. Keep speculative decoding / hierarchical
+  # cache / PD disaggregation off (defaults) — see raas.yaml.
+  enable_return_routed_experts: true
+  # B200 (sm_100) note: leave attention_backend unset so sglang
+  # auto-selects for the arch; run a single /generate smoke test on this
+  # node before trusting the full pipeline (the sm_100 kernel path is
+  # newer than the validated sm_90 one).

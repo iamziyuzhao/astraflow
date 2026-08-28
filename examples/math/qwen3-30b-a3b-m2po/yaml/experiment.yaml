@@ -1,0 +1,167 @@
+# ============================================================================
+# Experiment config — AstraFlow service + Trainer
+# Experiment: math / qwen3-30b-a3b-m2po
+#
+# Qwen3-30B-A3B (MoE, 128 experts / top-8) math RL with M2PO and
+# Rollout Routing Replay (R3), **Megatron training backend**
+# (TP=2, EP=2, ETP=1, PP=1, DP=3 on 6 GPUs), full TCP weight transfer.
+# Bring-up config: context 4096 — validate weight sync, determinism, and
+# R3 capture/replay before scaling context.
+#
+# R3 flags (all three must be on together):
+#   raas.models.model0.gconfig.return_routed_experts  — per-request capture
+#   sglang.enable_return_routed_experts (raas yaml)   — server-side capturer
+#   trainer_base.actor.megatron.moe_router_replay     — trainer-side replay
+#
+# GPU layout (default, 6 trainer GPUs + remote rollout node):
+#   TRAINER_MODEL0_GPUS=0,1,2,3,4,5 -> Trainer model0 (Megatron TP2/EP2/DP3)
+#   Remote rollout node (4 GPUs)    -> RaaS (model0 dp=4, tp=1)
+# ============================================================================
+
+# ── Experiment: identity, model, shared settings ──
+experiment:
+  experiment_name: astraflow-math
+  trial_name: qwen3-30b-a3b-m2po
+  fileroot: ./data-experiments/${experiment.experiment_name}/${experiment.trial_name}
+
+  model_path: "Qwen/Qwen3-30B-A3B"
+  tokenizer_path: "Qwen/Qwen3-30B-A3B"
+  seed: 1
+  dtype: bfloat16
+  weight_transfer_mode: tcp
+  # Full sync (not delta) for MoE bring-up: MoE per-step delta density is
+  # unmeasured, and a delta overflowing the pre-allocated buffer permanently
+  # falls back to full anyway. Revisit after measuring.
+  weight_transfer_strategies: full
+
+# ── RaaS: what to generate (inference-level config) ──
+raas:
+  models:
+    model0:
+      backend: sglang
+      gconfig:
+        n_samples: 8
+        temperature: 1.0
+        # ctx-4096 bring-up: prompt (<=1024) + 3000 new tokens < 4096.
+        max_new_tokens: 3000
+        min_new_tokens: 0
+        # R3: request per-token routed expert indices with every rollout.
+        # Requires sglang.enable_return_routed_experts on the RaaS side.
+        return_routed_experts: true
+
+# ── AstraFlow: data pipeline ──
+dataflow:
+  host: "0.0.0.0"
+  port: 8000
+
+  buffer:
+    size: 10000
+    replay_size: 10000
+    replay_ratio: 0
+    max_staleness: 8
+    filter_function: filter_zero_adv
+
+  rollout_dataset:
+    dataset_fn: "astraflow.dataflow.dataset.deepscaler:get_deepscaler_rl_dataset"
+    # ctx-4096 bring-up: keep prompts short.
+    max_length: 1024
+
+  workflow_spec:
+    workflow_cls: "rlvr"
+    reward_fn: "math_verify"
+    enable_thinking: false
+
+  eval_workflows:
+    math_eval:
+      workflow_cls: "rlvr"
+      reward_fn: "math_verify"
+      enable_thinking: false
+      gconfig_overrides:
+        temperature: 0.6
+        n_samples: 1
+        max_new_tokens: 3000
+
+  eval_datasets:
+    math500:
+      dataset_fn: "astraflow.dataflow.dataset.math500:get_math500_test_dataset"
+      max_length: 1000
+      repeat: 4
+      eval_workflow: math_eval
+
+# ── Trainer base: shared config ──
+trainer_base:
+  total_train_steps: 800
+  # Divisible by dp_world_size * group_size = 3 * 8 = 24 so the
+  # zero-adv filter and DP redistribute stay clean (see
+  # ppo_trainer._filter_zero_adv_in_batch).
+  train_batch_size: 240
+  n_samples: 8
+  # Megatron training backend for the MoE model. 6-GPU layout:
+  # world = tp * pp * dp = 2 * 1 * 3 = 6; expert layers use
+  # ep=2 / etp=1 nested inside the dp domain
+  # (expert_model_parallel_size = pp * etp * ep = 2 divides world=6).
+  engine:
+    backend: megatron
+    data_parallel_size: 3
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    expert_parallel_size: 2
+    expert_tensor_parallel_size: 1
+
+  actor:
+    gradient_checkpointing: true
+    mb_spec:
+      # ctx 4096 + headroom (mirrors the 16k recipes' 17408 = 16384 + 1024).
+      max_tokens_per_mb: 4608
+    optimizer:
+      type: adam
+      lr: 5e-6
+      weight_decay: 0.01
+      beta1: 0.9
+      beta2: 0.999
+      eps: 1e-8
+      lr_scheduler_type: constant
+      gradient_clipping: 1.0
+    # PPO / M2PO algorithm
+    m2_threshold: 0.01
+    eps_clip: 100.0
+    eps_clip_higher: 100.0
+    reward_scaling: 1
+    reward_bias: 0
+    kl_ctl: 0.00
+    kl_penalty_coef: 0.001
+    ppo_n_minibatches: 4
+    reward_norm: { mean_level: group, std_level: group }
+    adv_norm: { mean_level: batch, std_level: batch }
+    megatron:
+      # Recommended for RL on MoE models: identical inputs must produce
+      # identical forwards, and the R3 replay equivalence gate depends on it.
+      use_deterministic_algorithms: true
+      # R3: replay the rollout-recorded routing in every training forward
+      # (prox logp, ref logp, ppo_update). Requires
+      # gconfig.return_routed_experts on the rollout side.
+      moe_router_replay: true
+
+  ref:
+    mb_spec:
+      max_tokens_per_mb: 4608
+
+  recover:
+    mode: auto
+    freq_steps: 25
+
+  evaluator:
+    eval_at_start: false
+    freq_steps: 25
+
+  stats_logger:
+    wandb:
+      mode: online
+      id_suffix: "uid"
+
+# ── Trainer for model0 — only overrides ──
+trainer_model0:
+  model_id: model0
+  stats_logger:
+    wandb:
+      tags: ["m2po", "math", "astraflow-v2", "qwen3-30b-a3b", "moe", "tcp", "ctx4k", "full", "megatron", "r3"]
