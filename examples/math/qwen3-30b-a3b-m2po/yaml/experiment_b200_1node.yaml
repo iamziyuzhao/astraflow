@@ -16,23 +16,34 @@
 # Why EP=4 / TP=1 rather than the 6-GPU H200 recipe's TP=2/EP=2/DP=3:
 # world = tp * pp * dp must equal the 4 launched ranks, so tp=1/pp=1 gives
 # dp=4, with ep=4 nested inside that DP domain (128 experts / 4 = 32 per
-# rank, an even split). At world=4 the expert weights are the only thing
-# worth sharding, and sharding them 4 ways is what makes the run fit.
-# Per trainer GPU:
-#   expert params   28.991 B / ep 4 = 7.248 B  -> 13.5 GiB bf16
-#   non-expert      1.541 B (replicated at TP=1) ->  2.9 GiB
-#   gradients (bf16, same shapes)                -> 16.4 GiB
-#   Adam fp32 master + m + v = 12 B/param, sharded over each parameter's
-#   own data-parallel group:
-#     non-expert  1.541 B / dp 4       = 0.385 B ->  4.3 GiB
-#     expert      expert-DP is dp/ep = 1, so NOT sharded:
-#                 7.248 B x 12 B                 -> 81.0 GiB
-#                                                 ----------
-#                                                    118 GiB
-# against ~177 GiB usable on a 183 GB B200, leaving ~59 GiB for activations
-# and workspace — comfortable with gradient_checkpointing and
-# max_tokens_per_mb 4608. The un-shardable expert optimizer state is the
-# dominant term; widening ep beyond 4 is what would shrink it further.
+# rank, an even split). Megatron reports 8,788,850,688 params per rank,
+# which is the 28.991 B of experts split 4 ways (7.248 B) plus the 1.541 B
+# of non-expert weights, replicated at TP=1.
+#
+# Per-GPU memory, measured rather than assumed -- a first attempt at pure
+# fp32 optimizer state OOMed at 171.4 GiB of the card's 178.3 GiB, in
+# fused_adam._initialize_state (Adam allocates its moments lazily on the
+# first step(), so forward and backward had already succeeded):
+#
+#                            fp32 (OOMs)   with the settings below
+#   bf16 params                 16.4 GiB          16.4 GiB
+#   main_grad buffer            32.7 GiB          16.4 GiB   (bf16)
+#   fp32 master (shard)         28.4 GiB          28.4 GiB
+#   exp_avg (shard)             28.4 GiB          14.2 GiB   (bf16)
+#   exp_avg_sq (shard)          28.4 GiB          28.4 GiB
+#                              ---------         ---------
+#   steady state               134.3 GiB         103.8 GiB
+#   + activations, NCCL,
+#     fragmentation (obs.)      ~37   GiB         ~37   GiB
+#                              ---------         ---------
+#                              ~171   GiB        ~141   GiB
+#
+# The "shard" rows are smaller than the full parameter count because the
+# distributed optimizer shards each parameter over ITS OWN data-parallel
+# group: the 1.541 B non-expert params shard over dp=4, but the expert
+# params do not shard at all, because the expert data-parallel group is
+# dp/ep = 1. That un-shardable 7.248 B is what dominates, and widening ep
+# is the only thing that shrinks it -- which at world=4 is already maxed.
 #
 # R3 flags (all three must be on together):
 #   raas.models.model0.gconfig.return_routed_experts  — per-request capture
@@ -156,6 +167,17 @@ trainer_base:
     reward_norm: { mean_level: group, std_level: group }
     adv_norm: { mean_level: batch, std_level: batch }
     megatron:
+      # Fit the optimizer state on a 183 GB card at ep=4 (see the header's
+      # measured breakdown). Master weights stay fp32 -- at lr 5e-6 the
+      # update is far below bf16 resolution -- and so does exp_avg_sq,
+      # whose small variance accumulations are the most precision-
+      # sensitive. The gradient buffer and first moment go to bf16, which
+      # is where the 30 GiB comes from.
+      use_precision_aware_optimizer: true
+      main_params_dtype: float32
+      main_grads_dtype: bfloat16
+      exp_avg_dtype: bfloat16
+      exp_avg_sq_dtype: float32
       # Recommended for RL on MoE models: identical inputs must produce
       # identical forwards, and the R3 replay equivalence gate depends on it.
       use_deterministic_algorithms: true
