@@ -921,6 +921,30 @@ def amend_position_ids(data: dict) -> dict:
     return data
 
 
+# NCCL has no int16 datatype, so `dist.broadcast`/`dist.all_gather` on an
+# int16 tensor raises "Input tensor data type is not supported for NCCL
+# process group: Short". The R3 routed-expert masks are int16 on purpose --
+# 48 layers x top-8 is 768 B/token at 2 bytes/entry, half what int32 costs,
+# and a 4096-token sequence is then exactly 3.00 MiB -- so they have to
+# cross a process group reinterpreted as a same-width supported dtype.
+# Both collectives are pure copies (no reduction arithmetic), so every bit
+# pattern round-trips exactly, including ones that are NaN as bfloat16.
+_NCCL_WIRE_DTYPE = {torch.int16: torch.bfloat16}
+
+
+def _nccl_wire_view(tensor: torch.Tensor) -> torch.Tensor:
+    """View `tensor` as a dtype NCCL can carry, sharing its storage.
+
+    Returns the tensor unchanged for every dtype NCCL already supports.
+    The result aliases the input, so a collective writing into the view
+    fills the original tensor.
+    """
+    wire = _NCCL_WIRE_DTYPE.get(tensor.dtype)
+    if wire is None:
+        return tensor
+    return tensor.view(wire)
+
+
 def broadcast_tensor(tensor: torch.Tensor | None, src_rank=0, group=None):
     """
     Broadcast a tensor from source rank to all other ranks in the process group.
@@ -959,7 +983,7 @@ def broadcast_tensor(tensor: torch.Tensor | None, src_rank=0, group=None):
 
         # Broadcast the actual tensor
         tensor = tensor.contiguous()
-        dist.broadcast(tensor, src=src_rank, group=group)
+        dist.broadcast(_nccl_wire_view(tensor), src=src_rank, group=group)
 
         return tensor
     else:
@@ -979,8 +1003,9 @@ def broadcast_tensor(tensor: torch.Tensor | None, src_rank=0, group=None):
         # Create tensor with the received shape and dtype
         tensor = torch.empty(tensor_shape, dtype=dtype, device=device)
 
-        # Receive the actual tensor data
-        dist.broadcast(tensor, src=src_rank, group=group)
+        # Receive the actual tensor data. The view aliases `tensor`, so the
+        # received bytes land in it directly.
+        dist.broadcast(_nccl_wire_view(tensor), src=src_rank, group=group)
 
         return tensor
 
@@ -1007,7 +1032,9 @@ def all_gather_tensor_container(data, group=None) -> list:
         y = _flatten_pad_to_max_numel(data, shapes)
 
         ys = [torch.empty_like(y) for _ in range(dist.get_world_size(group=group))]
-        dist.all_gather(ys, y, group=group)
+        dist.all_gather(
+            [_nccl_wire_view(o) for o in ys], _nccl_wire_view(y), group=group
+        )
 
         return [_unpad_unflatten(y, shape) for y, shape in zip(ys, shapes)]
 

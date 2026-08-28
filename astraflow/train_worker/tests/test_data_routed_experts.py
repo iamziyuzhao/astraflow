@@ -19,10 +19,12 @@ dims. These tests pin the shape-based behavior:
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from astraflow.train_worker.api.cli_args import MicroBatchSpec
 from astraflow.train_worker.utils.data import (
+    _nccl_wire_view,
     concat_padded_tensors,
     pack_tensor_dict,
     pad_packed_tensor_dict,
@@ -201,3 +203,54 @@ class TestConcatPaddedTensors:
         _assert_rows_aligned(out["input_ids"], out["routed_experts"])
         assert (out["attention_mask"][1, short:] == 0).all()
         assert (out["routed_experts"][1, short:] == 0).all()
+
+
+class TestNcclWireView:
+    """``_nccl_wire_view`` bridges dtypes NCCL cannot carry.
+
+    NCCL has no int16 datatype, so broadcasting the R3 ``routed_experts``
+    mask raised ``TypeError: Input tensor data type is not supported for
+    NCCL process group: Short`` at the first training step -- the batch
+    broadcast in ``prepare_batch_from_buffer`` hit it before any forward
+    ran. The masks stay int16 (768 B/token for 48 layers x top-8, half
+    what int32 costs), so the transport reinterprets them instead.
+    """
+
+    def test_int16_views_as_bfloat16_and_aliases_storage(self):
+        x = torch.tensor([[0, 1, -1, 127, -32768, 32767]], dtype=torch.int16)
+        wire = _nccl_wire_view(x)
+
+        assert wire.dtype is torch.bfloat16
+        assert wire.shape == x.shape
+        assert wire.data_ptr() == x.data_ptr()
+
+    def test_round_trip_preserves_every_bit_pattern(self):
+        # Every int16 value, including the ones that are NaN/Inf as bfloat16.
+        x = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16)
+        recovered = _nccl_wire_view(x).view(torch.int16)
+        assert torch.equal(recovered, x)
+
+    def test_receiving_rank_pattern_fills_the_original_tensor(self):
+        # Mirrors the non-source branch of broadcast_tensor: allocate in the
+        # true dtype, hand the collective a wire view, read back the original.
+        src = torch.tensor([[3, -7, 20000]], dtype=torch.int16)
+        dst = torch.empty_like(src)
+        _nccl_wire_view(dst).copy_(_nccl_wire_view(src))
+        assert torch.equal(dst, src)
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            torch.int8,
+            torch.int32,
+            torch.int64,
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+            torch.bool,
+        ],
+    )
+    def test_supported_dtypes_pass_through_untouched(self, dtype):
+        x = torch.ones((2, 3), dtype=dtype)
+        assert _nccl_wire_view(x) is x
