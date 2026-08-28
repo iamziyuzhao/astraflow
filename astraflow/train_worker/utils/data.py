@@ -220,9 +220,10 @@ def concat_padded_tensors(
                     )
 
                 else:
-                    # Pad feature tensors with pad_value
+                    # Pad feature tensors with pad_value, preserving trailing
+                    # dims (e.g. routed_experts [B, S, num_moe_layers, top_k])
                     padding = torch.full(
-                        (tensor.shape[0], pad_width),
+                        (tensor.shape[0], pad_width, *tensor.shape[2:]),
                         pad_value,
                         dtype=tensor.dtype,
                         device=tensor.device,
@@ -515,9 +516,14 @@ def split_padded_tensor_dict_into_mb_list(
         if key in multimodal_keys:
             continue
         if key == "position_ids" or (
-            torch.is_tensor(value) and value.numel() == bs * max_seqlen
+            torch.is_tensor(value)
+            and value.ndim >= 2
+            and value.shape[:2] == (bs, max_seqlen)
         ):
-            # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3
+            # NOTE: shape-based check so per-token tensors with trailing dims
+            # (e.g. routed_experts [B, S, num_moe_layers, top_k]) are split by
+            # row instead of duplicated into every micro-batch. qwen2.5-vl
+            # position_ids ([bs, max_seqlen, 3]) keeps its explicit key check.
             to_split[key] = value
         else:
             not_to_split[key] = value
@@ -678,9 +684,13 @@ def pad_packed_tensor_dict(
                             new_end - new_start, dtype=value.dtype, device=value.device
                         )
                 sequence_padded_data[key] = new_value
-            elif torch.is_tensor(value) and value.numel() == total_length:
+            elif (
+                torch.is_tensor(value)
+                and value.ndim >= 1
+                and value.shape[0] == total_length
+            ):
                 new_value = torch.full(
-                    padded_shape,
+                    (padded_shape[0], *value.shape[1:]),
                     fill_value=pad_value,
                     dtype=value.dtype,
                     device=value.device,
@@ -737,11 +747,16 @@ def pad_packed_tensor_dict(
                 pad = torch.arange(pad_length, dtype=torch.long, device=value.device)
                 padded_tensor = torch.cat([value, pad])
             padded_data[key] = padded_tensor
-        elif torch.is_tensor(value) and value.numel() == total_length:
-            # Pad the tensor to the new total length
-            padded_tensor = torch.nn.functional.pad(
-                value, (0, pad_length), value=pad_value
-            )
+        elif (
+            torch.is_tensor(value)
+            and value.ndim >= 1
+            and value.shape[0] == total_length
+        ):
+            # Pad the first (token) dim to the new total length; trailing dims
+            # (e.g. routed_experts [total_length, num_moe_layers, top_k]) are
+            # left untouched.
+            pad_spec = (0, 0) * (value.ndim - 1) + (0, pad_length)
+            padded_tensor = torch.nn.functional.pad(value, pad_spec, value=pad_value)
             padded_data[key] = padded_tensor
         else:
             padded_data[key] = value
@@ -870,7 +885,8 @@ def unsqueeze_packed_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
                 "max_seqlen",
             ]
             and torch.is_tensor(value)
-            and value.numel() == total_length
+            and value.ndim >= 1
+            and value.shape[0] == total_length
         ):
             new_data[key] = value.unsqueeze(dim=0)
         else:
