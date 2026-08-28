@@ -4,6 +4,73 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.utils import get_model_config
+
+from astraflow.train_worker.utils.mcore.routing_replay import (
+    get_replay_chunk_index,
+    get_replay_context,
+)
+
+
+def split_packed_tensor_context_parallel(
+    values: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Zigzag context-parallel split of a packed tensor along its token axis.
+
+    Generalizes the split performed by `preprocess_packed_seqs_context_parallel`
+    to tensors with arbitrary trailing dims (e.g. routed_experts of shape
+    [total_tokens, num_moe_layers, top_k]): each sequence is cut into CP*2
+    chunks and rank r keeps chunks r and 2*CP-1-r.
+    """
+    if cp_size <= 1:
+        return values
+    input_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    batch_size = input_lens.shape[0]
+
+    shape = (int(input_lens.sum().item()) // cp_size, *values.shape[1:])
+    splitted = torch.zeros(shape, dtype=values.dtype, device=values.device)
+    for i in range(batch_size):
+        seqlen = input_lens[i] // cp_size
+        half_seqlen = seqlen // 2
+        start_idx = cu_seqlens[i] // cp_size
+        # split to 2 chunks
+        d = values[cu_seqlens[i] : cu_seqlens[i + 1]]
+        splitted[start_idx : start_idx + half_seqlen] = d[
+            half_seqlen * cp_rank : half_seqlen * (cp_rank + 1)
+        ]
+
+        remain_start = input_lens[i] - half_seqlen * (cp_rank + 1)
+        remain_end = input_lens[i] - half_seqlen * cp_rank
+        remain_end = min(remain_end, d.shape[0])
+        remain_len = remain_end - remain_start
+        splitted[start_idx + half_seqlen : start_idx + half_seqlen + remain_len] = d[
+            remain_start:remain_end
+        ]
+    return splitted
+
+
+def sequence_parallel_chunk(
+    values: torch.Tensor,
+    tp_size: int,
+    tp_rank: int,
+) -> torch.Tensor:
+    """Contiguous per-TP-rank chunk along the token axis.
+
+    Mirrors `scatter_to_sequence_parallel_region`: with sequence parallelism
+    the transformer layers (and thus the MoE routers) only see the local
+    contiguous 1/tp_size chunk of the packed sequence.
+    """
+    total_tokens = values.shape[0]
+    if total_tokens % tp_size != 0:
+        raise ValueError(
+            f"Packed token count {total_tokens} is not divisible by "
+            f"tensor parallel size {tp_size} for sequence parallelism."
+        )
+    chunk_len = total_tokens // tp_size
+    return values[tp_rank * chunk_len : (tp_rank + 1) * chunk_len]
 
 
 def preprocess_packed_seqs_context_parallel(
@@ -17,7 +84,6 @@ def preprocess_packed_seqs_context_parallel(
     """
     input_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     max_seqlen = input_lens.max().item()
-    batch_size = input_lens.shape[0]
 
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
@@ -44,25 +110,9 @@ def preprocess_packed_seqs_context_parallel(
     if cp_size <= 1:
         return input_ids.unsqueeze(0), packed_seq_params
 
-    shape = (input_lens.sum().item() // cp_size,)
-    splitted = torch.zeros(shape, dtype=input_ids.dtype, device=input_ids.device)
-    for i in range(batch_size):
-        seqlen = input_lens[i] // cp_size
-        half_seqlen = seqlen // 2
-        start_idx = cu_seqlens[i] // cp_size
-        # split to 2 chunks
-        d = input_ids[cu_seqlens[i] : cu_seqlens[i + 1]]
-        splitted[start_idx : start_idx + half_seqlen] = d[
-            half_seqlen * cp_rank : half_seqlen * (cp_rank + 1)
-        ]
-
-        remain_start = input_lens[i] - half_seqlen * (cp_rank + 1)
-        remain_end = input_lens[i] - half_seqlen * cp_rank
-        remain_end = min(remain_end, d.shape[0])
-        remain_len = remain_end - remain_start
-        splitted[start_idx + half_seqlen : start_idx + half_seqlen + remain_len] = d[
-            remain_start:remain_end
-        ]
+    splitted = split_packed_tensor_context_parallel(
+        input_ids, cu_seqlens, cp_size, cp_rank
+    )
     return splitted.unsqueeze(0), packed_seq_params
 
 
@@ -120,6 +170,26 @@ def postprocess_packed_seqs_context_parallel(
     return output_new
 
 
+def _split_routed_experts_for_model_parallel(
+    model: torch.nn.Module,
+    routed_experts: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Slice packed routed_experts down to the rows this rank's routers see."""
+    routed_experts = split_packed_tensor_context_parallel(
+        routed_experts,
+        cu_seqlens,
+        mpu.get_context_parallel_world_size(),
+        mpu.get_context_parallel_rank(),
+    )
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    if tp_size > 1 and get_model_config(model).sequence_parallel:
+        routed_experts = sequence_parallel_chunk(
+            routed_experts, tp_size, mpu.get_tensor_model_parallel_rank()
+        )
+    return routed_experts
+
+
 def packed_context_parallel_forward(
     model: torch.nn.Module,
     input_: dict[str, Any],
@@ -127,10 +197,30 @@ def packed_context_parallel_forward(
     input_ids = input_["input_ids"]
     cu_seqlens = input_["cu_seqlens"]
     position_ids = input_["position_ids"]
+    # NOTE: read, never pop. With virtual pipeline parallelism megatron hands
+    # the *same* micro-batch dict to every model chunk's forward, and each
+    # chunk must install the records for the layers it hosts right before its
+    # own forward consumes them (install/consume lockstep). Popping would both
+    # restrict the install to chunk 0 -- appending records for layers hosted on
+    # later chunks that those chunks' forwards do not consume in step, which
+    # silently serves the wrong micro-batch's routing under activation
+    # recompute -- and permanently mutate mb_list.padded_mbs, breaking a second
+    # forward_backward_batch over the same micro-batch list.
+    routed_experts = input_.get("routed_experts")
     input_ids_rmpad, packed_seq_params = preprocess_packed_seqs_context_parallel(
         input_ids, cu_seqlens
     )
     input_ids_rmpad = input_ids_rmpad.contiguous()
+    replay_context = get_replay_context()
+    if (
+        replay_context is not None
+        and replay_context.is_armed
+        and routed_experts is not None
+    ):
+        replay_context.install_packed(
+            _split_routed_experts_for_model_parallel(model, routed_experts, cu_seqlens),
+            chunk_index=get_replay_chunk_index(model),
+        )
     try:
         output_orig = model(
             input_ids=input_ids_rmpad,

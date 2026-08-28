@@ -67,6 +67,15 @@ from astraflow.train_worker.utils.mcore.packed_context_parallel import (
 from astraflow.train_worker.utils.mcore.pipeline_parallel import (
     configure_pipeline_layer_splits,
 )
+from astraflow.train_worker.utils.mcore.routing_replay import (
+    RoutingReplayContext,
+    assert_router_config_supported,
+    hf_moe_layer_indices,
+    install_topk_router_patch,
+    release_replay_context,
+    set_replay_chunk_index,
+    set_replay_context,
+)
 from astraflow.train_worker.utils.megatron_checkpointer import MegatronCheckpointManager
 from astraflow.train_worker.utils.model import disable_dropout_in_model
 from astraflow.train_worker.utils.offload import is_tms_enabled
@@ -120,6 +129,7 @@ class MegatronEngine(TrainEngine):
         self.seed: int = 0
         self.own_global_group: bool = False
         self.is_offload: bool = False
+        self.routing_replay_context: RoutingReplayContext | None = None
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         if parallel_strategy is None:
@@ -252,6 +262,9 @@ class MegatronEngine(TrainEngine):
         # NOTE: It is recommended to set this option to True for RL training on MoE models for stability.
         if self.mcore_config.use_deterministic_algorithms:
             set_deterministic_algorithms(model_config)
+
+        if self.mcore_config.moe_router_replay:
+            self._init_routing_replay()
 
         # Set vp_stage for DDP models
         for i, model_chunk in enumerate(self.model):
@@ -459,6 +472,70 @@ class MegatronEngine(TrainEngine):
         assert self.lr_scheduler is not None, "LR Scheduler is not initialized."
         self.lr_scheduler.step(1)
 
+    def _init_routing_replay(self) -> None:
+        """Install the R3 TopKRouter patch and build this rank's replay context.
+
+        Maps every local router's megatron ``layer_number`` (1-based, global
+        across PP/VPP stages) to its ordinal along the MoE-layer axis of the
+        rollout-recorded ``routed_experts`` tensor (HF layer order). The map is
+        built **per model chunk** and each chunk is stamped with its index, so
+        that under virtual pipeline parallelism a chunk's forward installs only
+        the records its own routers consume (install/consume lockstep — see
+        ``routing_replay`` module docstring).
+
+        The context is deliberately NOT installed as the process-wide active
+        context here: a trainer builds actor / critic / ref engines in sequence
+        in one process, and a second registration would silently displace the
+        first. It is installed only for the duration of a forward/backward pass
+        by :meth:`forward_backward_batch`.
+        """
+        from megatron.core.transformer.moe.router import TopKRouter
+
+        install_topk_router_patch()
+        moe_layers = hf_moe_layer_indices(self.hf_config)
+        if not moe_layers:
+            raise ValueError(
+                "megatron.moe_router_replay=True, but the model config declares "
+                "no MoE layers."
+            )
+        chunk_layer_maps: list[dict[int, int]] = []
+        for chunk_index, model_chunk in enumerate(self.model):
+            module = model_chunk.module if isinstance(model_chunk, DDP) else model_chunk
+            layer_map: dict[int, int] = {}
+            for submodule in module.modules():
+                if isinstance(submodule, TopKRouter):
+                    assert_router_config_supported(
+                        submodule.config, submodule.layer_number
+                    )
+                    layer_number = submodule.layer_number
+                    if (layer_number - 1) not in moe_layers:
+                        raise ValueError(
+                            f"Found a TopKRouter on megatron layer {layer_number}, "
+                            f"which is not an MoE layer per the HF config "
+                            f"(MoE layers: {moe_layers})."
+                        )
+                    layer_map[layer_number] = moe_layers.index(layer_number - 1)
+            set_replay_chunk_index(model_chunk, chunk_index)
+            chunk_layer_maps.append(layer_map)
+        if not any(chunk_layer_maps):
+            raise ValueError(
+                "megatron.moe_router_replay=True, but no TopKRouter was found "
+                "on this pipeline stage."
+            )
+        self.routing_replay_context = RoutingReplayContext(
+            chunk_layer_maps=chunk_layer_maps,
+            num_moe_layers=len(moe_layers),
+            owner=(
+                f"{type(self).__name__}(id=0x{id(self):x}, path={self.config.path}, "
+                f"is_critic={self.config.is_critic})"
+            ),
+        )
+        self.logger.info(
+            "R3 routing replay enabled for megatron layers "
+            f"{[sorted(m) for m in chunk_layer_maps]} "
+            f"({len(chunk_layer_maps)} model chunk(s))."
+        )
+
     def forward_backward_batch(
         self,
         mb_list: MicroBatchList,
@@ -493,21 +570,49 @@ class MegatronEngine(TrainEngine):
                 )
             return output, functools.partial(_process_output, mb_input.orig_mb)
 
+        replay_context = self.routing_replay_context
+        if replay_context is not None:
+            missing = [
+                i
+                for i, mb in enumerate(mb_list.padded_mbs)
+                if "routed_experts" not in mb
+            ]
+            if missing:
+                raise ValueError(
+                    "megatron.moe_router_replay=True, but micro-batches "
+                    f"{missing} carry no 'routed_experts' tensor. Enable R3 "
+                    "capture on the rollout side (return_routed_experts) or "
+                    "disable moe_router_replay."
+                )
+
         forward_backward_func = get_forward_backward_func()
         with trace_scope("megatron_engine.forward_backward"):
             if len(self.model) > 1:
                 data_iterator = [iter(mb_list) for _ in range(len(self.model))]
             else:
                 data_iterator = iter(mb_list)
-            forward_backward_func(
-                forward_step_func=forward_step,
-                data_iterator=data_iterator,
-                model=self.model if len(self.model) > 1 else self.model[0],
-                num_microbatches=len(mb_list),
-                seq_length=mb_list.max_seqlen,  # no use when input_shapes was set
-                micro_batch_size=1,  # no use when input_shapes was set
-                forward_only=forward_only,
-            )
+            if replay_context is not None:
+                # Install for the duration of this pass only, so that several
+                # in-process engines (actor / critic / ref) cannot silently
+                # displace each other's context; raises on a real conflict.
+                set_replay_context(replay_context)
+                replay_context.begin_pass(forward_only=forward_only)
+            try:
+                forward_backward_func(
+                    forward_step_func=forward_step,
+                    data_iterator=data_iterator,
+                    model=self.model if len(self.model) > 1 else self.model[0],
+                    num_microbatches=len(mb_list),
+                    seq_length=mb_list.max_seqlen,  # no use when input_shapes was set
+                    micro_batch_size=1,  # no use when input_shapes was set
+                    forward_only=forward_only,
+                )
+                if replay_context is not None:
+                    replay_context.assert_all_consumed(require_records=True)
+            finally:
+                if replay_context is not None:
+                    replay_context.end_pass()
+                    release_replay_context(replay_context)
 
     def train_batch(
         self,
