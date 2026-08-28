@@ -54,9 +54,51 @@ def default_data_extract_prompt_fn(data: dict[str, Any]) -> Any:
     # Append solve instruction suffix to user messages
     return [
         {**m, "content": m["content"] + SOLVER_PROMPT_SUFFIX}
-        if m["role"] == "user" else m
+        if m["role"] == "user"
+        else m
         for m in messages
     ]
+
+
+# R3: stop reasons that mark a request the rollout engine killed mid-flight.
+# Such a response may legitimately carry no routed-experts record — nothing
+# recordable was ever forwarded — so it is dropped per-sample instead of
+# failing the whole run.
+ABORTED_STOP_REASONS = frozenset({"abort", "interrupt"})
+
+
+def _routing_miss_is_per_sample(resp: ModelResponse) -> bool:
+    """Whether an absent routed-experts payload is this one sample's accident.
+
+    A response that was aborted/interrupted, or that generated no tokens at
+    all, never ran a forward the rollout engine could have recorded, so an
+    empty record says nothing about how the server was configured. Any other
+    response — one that completed normally and produced tokens — coming back
+    with no payload whatsoever means the engine never captured routing for
+    *any* request, which is systemic rather than per-sample.
+    """
+    return resp.stop_reason in ABORTED_STOP_REASONS or resp.output_len == 0
+
+
+def _missing_routing_payload_error(resp: ModelResponse) -> RuntimeError:
+    """Build the fail-fast error for a systemically absent routing payload."""
+    return RuntimeError(
+        "R3 is enabled on this workflow "
+        "(GenerationHyperparameters.return_routed_experts=True) but the "
+        "rollout engine returned a normally-completed response carrying no "
+        "routed-experts payload at all (stop_reason="
+        f"{resp.stop_reason!r}, output_len={resp.output_len}). The SGLang "
+        "server was very likely launched WITHOUT "
+        "enable_return_routed_experts: such a server still accepts "
+        "return_routed_experts on the request and answers successfully, but "
+        "omits meta_info['routed_experts'] from the reply. Every sample would "
+        "then be silently dropped, the rollout buffer would never fill, and "
+        "training would hang until the batch timeout with a traceback "
+        "pointing nowhere near the missing flag. Relaunch the inference "
+        "server with SGLangConfig.enable_return_routed_experts=True "
+        "(requires sglang>=0.5.13), or set return_routed_experts=False to "
+        "train without routing replay."
+    )
 
 
 @register_workflow("rlvr")
@@ -95,6 +137,63 @@ class RLVRWorkflow(RolloutWorkflow):
         self.data_extract_prompt_fn = data_extract_prompt_fn
         if self.dump_dir is not None and not os.path.exists(self.dump_dir):
             os.makedirs(self.dump_dir, exist_ok=True)
+
+    def _build_routed_experts(
+        self, resp: ModelResponse, seq_len: int
+    ) -> torch.Tensor | None:
+        """Build the per-position routed-experts tensor for one sequence.
+
+        Returns an int16 tensor of shape ``[seq_len, num_moe_layers, top_k]``:
+        rows 0..seq_len-2 are the expert ids recorded by the rollout engine
+        and row seq_len-1 is synthetic (the final position is never forwarded
+        during rollout; its output receives no loss gradient). Returns None
+        when *this* response carries no usable record — an aborted request, or
+        a row-count/shape mismatch — such samples must be dropped, never
+        zero-filled.
+
+        Raises
+        ------
+        RuntimeError
+            When a normally-completed response carries no routing payload at
+            all. That is a systemic misconfiguration (almost always an SGLang
+            server launched without ``enable_return_routed_experts``), not a
+            per-sample accident, and dropping such samples would empty the
+            rollout buffer and hang training for an hour.
+        """
+        recorded = resp.output_routed_experts
+        if recorded is None:
+            if not _routing_miss_is_per_sample(resp):
+                # TODO(agent): the complete fix is a pre-flight capability
+                # handshake — when return_routed_experts is requested, have
+                # the inference engine query the server (e.g. /get_server_info)
+                # for enable_return_routed_experts and refuse to start the
+                # rollout at all. That check belongs in raas/engine/, not in a
+                # workflow, so this fails on the first response received rather
+                # than before the first request is sent.
+                raise _missing_routing_payload_error(resp)
+            logger.warning(
+                "return_routed_experts is enabled but this response has no "
+                f"routed experts (stop_reason={resp.stop_reason}, "
+                f"output_len={resp.output_len}); dropping sample."
+            )
+            return None
+        if recorded.ndim != 3 or recorded.shape[0] != seq_len - 1:
+            logger.warning(
+                f"Routed experts shape {tuple(recorded.shape)} does not match "
+                f"expected [{seq_len - 1}, num_moe_layers, top_k]; dropping sample."
+            )
+            return None
+        recorded_t = torch.tensor(recorded, dtype=torch.int16)
+        num_moe_layers, top_k = recorded_t.shape[1], recorded_t.shape[2]
+        # Synthetic row for the never-forwarded final position. The model
+        # config (num_experts) is not available in this workflow, but
+        # arange(top_k) % num_experts == arange(top_k) for every valid config
+        # since top_k <= num_experts, so ids 0..top_k-1 are always legal
+        # logical expert ids.
+        final_row = torch.arange(top_k, dtype=torch.int16).expand(
+            1, num_moe_layers, top_k
+        )
+        return torch.cat([recorded_t, final_row], dim=0)
 
     @trace_session("reward")
     async def _compute_rewards(
@@ -186,6 +285,11 @@ class RLVRWorkflow(RolloutWorkflow):
                 "attention_mask": torch.ones(len(seq), dtype=torch.bool),
                 "rewards": torch.tensor(reward, dtype=torch.float32),
             }
+            if self.gconfig.return_routed_experts:
+                routed_experts = self._build_routed_experts(resp, len(seq))
+                if routed_experts is None:
+                    continue
+                res["routed_experts"] = routed_experts
             res = {k: v.unsqueeze(0) for k, v in res.items()}
             results.append(res)
 
