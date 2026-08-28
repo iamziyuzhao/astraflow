@@ -216,7 +216,12 @@ trainer_base:
 
   recover:
     mode: auto
-    freq_steps: 25
+    # 10, not the 6-GPU recipe's 25. This node is shared, and the failure
+    # that actually ends runs here is another user's job landing 40-50 GB on
+    # a GPU this one already occupies -- observed at step 9 with the trainer
+    # itself using only 130.7 GiB of 178.3 GiB. Checkpointing more often
+    # bounds what a collision costs to ~20 min of training.
+    freq_steps: 10
 
   evaluator:
     eval_at_start: false
