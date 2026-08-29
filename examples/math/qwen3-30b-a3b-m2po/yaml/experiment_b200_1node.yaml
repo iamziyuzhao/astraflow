@@ -60,6 +60,9 @@
 experiment:
   experiment_name: astraflow-math
   trial_name: qwen3-30b-a3b-m2po-b200
+  # NOTE: a recover checkpoint here is ~100 GB. Point this at a filesystem
+  # with room -- on a shared box, filling the one everyone else uses is a
+  # real hazard, not just a failed run.
   fileroot: ./data-experiments/${experiment.experiment_name}/${experiment.trial_name}
 
   model_path: "Qwen/Qwen3-30B-A3B"
@@ -216,12 +219,15 @@ trainer_base:
 
   recover:
     mode: auto
-    # 10, not the 6-GPU recipe's 25. This node is shared, and the failure
-    # that actually ends runs here is another user's job landing 40-50 GB on
-    # a GPU this one already occupies -- observed at step 9 with the trainer
-    # itself using only 130.7 GiB of 178.3 GiB. Checkpointing more often
-    # bounds what a collision costs to ~20 min of training.
-    freq_steps: 10
+    # 20. Two competing pressures: this node is shared, and the failure that
+    # actually ends runs here is another user's job landing 40-50 GB on a GPU
+    # this one already occupies (observed at step 9, with the trainer itself
+    # using only 130.7 GiB of 178.3 GiB) -- which argues for checkpointing
+    # often. But a recover checkpoint for this model is ~100 GB of parameters
+    # and optimizer state, so checkpointing often is expensive in both I/O and
+    # disk, and `fileroot` must point at a filesystem that can absorb it.
+    # 20 steps is ~40 min of work at risk against ~100 GB written per save.
+    freq_steps: 20
 
   evaluator:
     eval_at_start: false
