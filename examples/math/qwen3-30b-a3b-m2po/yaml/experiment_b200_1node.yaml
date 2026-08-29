@@ -166,13 +166,18 @@ trainer_base:
   actor:
     gradient_checkpointing: true
     mb_spec:
-      # 2048, halved from the 4608 the other recipes use. Restoring the
-      # reference policy costs ~16.4 GiB/GPU of parameters plus a second
-      # forward pass, and at 4608 tokens per microbatch that did not fit --
-      # the card was left with 7.88 MiB free. Smaller microbatches cut the
-      # activation peak for both forwards, trading more microbatch
-      # iterations per step for the headroom the regulariser needs.
-      max_tokens_per_mb: 2048
+      # 4096, down from the 4608 the other recipes use, and NOT lower: the
+      # microbatch packer requires max_tokens_per_mb >= the longest sequence,
+      # so 2048 failed outright with
+      #     RuntimeError: Values [2120 1850 2071 ...] is larger than capacity
+      # context_length is 4096, so 4096 is the smallest value that can always
+      # hold one sequence.
+      #
+      # This matters because the reference policy has to fit alongside the
+      # actor. Measured on this hardware: 134 GB/GPU at mb 2048 with the
+      # reference model present, against an OOM at mb 4608 -- so the second
+      # model is affordable and the activation peak is what is not.
+      max_tokens_per_mb: 4096
     optimizer:
       type: adam
       lr: 5e-6
@@ -236,7 +241,7 @@ trainer_base:
   ref:
     mb_spec:
       # Match the actor; see its mb_spec note.
-      max_tokens_per_mb: 2048
+      max_tokens_per_mb: 4096
 
   recover:
     # disabled, deliberately. Resuming does not work in this setup: a
