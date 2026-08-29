@@ -232,19 +232,20 @@ trainer_base:
   # memory for a model that never contributes to the loss.
 
   recover:
-    mode: auto
-    # 20. This node is shared, and the failure that actually ends runs here is
-    # another user's job landing 40-50 GB on a GPU this one already occupies
-    # (observed at step 9, with the trainer itself using only 130.7 GiB of
-    # 178.3 GiB) -- which argues for checkpointing often.
+    # disabled, deliberately. Resuming does not work in this setup: a
+    # complete 285 GB checkpoint (8 .distcp shards plus metadata, written
+    # cleanly at step 99) fails to load with
+    #     AttributeError: 'Metadata' object has no attribute 'mcore_data'
+    # -- the saved distributed-checkpoint metadata lacks the field Megatron's
+    # reader expects, so this is a save/load format mismatch rather than a
+    # damaged file.
     #
-    # MEASURED: a recover checkpoint for this model is 285 GB, not the ~100 GB
-    # first assumed -- 30.5 B parameters at 10 bytes each (fp32 master + bf16
-    # params + bf16 exp_avg + bf16 exp_avg_sq). Only one is retained, but the
-    # old and new copies coexist during a write, so `fileroot` needs roughly
-    # 570 GB of headroom, not 285. Frequency does not change that peak; it
-    # only trades write churn against how much work a crash costs.
-    freq_steps: 20
+    # With loading broken, checkpoints are write-only: 285 GB and roughly 9%
+    # of step time spent producing something that cannot be read back. Until
+    # the format mismatch is fixed, not writing them is strictly better, and
+    # the trade is that a crash restarts from step 0 rather than losing at
+    # most 20 steps.
+    mode: disabled
 
   evaluator:
     eval_at_start: false
