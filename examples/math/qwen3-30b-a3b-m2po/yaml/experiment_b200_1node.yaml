@@ -235,6 +235,16 @@ trainer_base:
   # No `ref:` block: with both KL terms at 0 the reference policy is never
   # constructed. See kl_penalty_coef for why it cannot be afforded here.
 
+  # HF-format weight export, which is SEPARATE from `recover` below and does
+  # not depend on the broken distributed-checkpoint load path. Without it a
+  # run produces no durable artifact at all: the first attempt peaked at
+  # MATH-500 avg@4 92.25 around step 200 and then eroded, and that peak model
+  # was unrecoverable because nothing was being written.
+  #
+  # 56.9 GiB per save, so 50 steps (~80 min) rather than every eval.
+  saver:
+    freq_steps: 50
+
   recover:
     # disabled, deliberately. Resuming does not work in this setup: a
     # complete 285 GB checkpoint (8 .distcp shards plus metadata, written
