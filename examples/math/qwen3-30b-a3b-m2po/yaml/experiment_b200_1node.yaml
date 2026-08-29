@@ -84,8 +84,13 @@ raas:
       gconfig:
         n_samples: 8
         temperature: 1.0
-        # ctx-4096 bring-up: prompt (<=1024) + 3000 new tokens < 4096.
-        max_new_tokens: 3000
+        # ctx-3072: prompt (<=1024) + 2048 new tokens = 3072. Shortened from
+        # 3000 because keeping the KL regulariser (which needs a second copy
+        # of the model) and a 4096-token microbatch do not both fit in 178
+        # GiB -- see the actor mb_spec note for the measurements. This does
+        # truncate the longest reasoning chains; it is a constraint of doing
+        # this on four GPUs, not a modelling choice.
+        max_new_tokens: 2048
         min_new_tokens: 0
         # R3: request per-token routed expert indices with every rollout.
         # Requires sglang.enable_return_routed_experts on the RaaS side.
@@ -134,7 +139,7 @@ dataflow:
       gconfig_overrides:
         temperature: 0.6
         n_samples: 1
-        max_new_tokens: 3000
+        max_new_tokens: 2048
 
   eval_datasets:
     math500:
@@ -166,18 +171,18 @@ trainer_base:
   actor:
     gradient_checkpointing: true
     mb_spec:
-      # 4096, down from the 4608 the other recipes use, and NOT lower: the
-      # microbatch packer requires max_tokens_per_mb >= the longest sequence,
-      # so 2048 failed outright with
-      #     RuntimeError: Values [2120 1850 2071 ...] is larger than capacity
-      # context_length is 4096, so 4096 is the smallest value that can always
-      # hold one sequence.
+      # 3072, matching the reduced context_length. The packer requires
+      # max_tokens_per_mb >= the longest sequence, so this value and the
+      # context length move together.
       #
-      # This matters because the reference policy has to fit alongside the
-      # actor. Measured on this hardware: 134 GB/GPU at mb 2048 with the
-      # reference model present, against an OOM at mb 4608 -- so the second
-      # model is affordable and the activation peak is what is not.
-      max_tokens_per_mb: 4096
+      # Measured on this hardware with the reference policy present:
+      #   mb 2048 -> 134 GB/GPU (fits, but below the longest sequence)
+      #   mb 4096 -> OOM at 178.34 GiB
+      #   mb 4608 -> OOM
+      # roughly 21 GB per additional 1024 tokens. Keeping the KL regulariser
+      # therefore costs context: 3072 is the largest budget that leaves the
+      # reference model room on a 183 GB card.
+      max_tokens_per_mb: 3072
     optimizer:
       type: adam
       lr: 5e-6
@@ -241,7 +246,7 @@ trainer_base:
   ref:
     mb_spec:
       # Match the actor; see its mb_spec note.
-      max_tokens_per_mb: 4096
+      max_tokens_per_mb: 3072
 
   recover:
     # disabled, deliberately. Resuming does not work in this setup: a
