@@ -21,7 +21,19 @@ rollout:
   max_concurrent_rollouts: 256
   max_concurrent_evals: 64
   pause_grace_period: 3
-  enable_adaptive_availability: true
+  # false. The adaptive controller drives /availability off sglang's load
+  # telemetry, and after a weight update it wipes its snapshot and repopulates
+  # from a cached poll. At 30B that poll is competing with a full 56.9 GiB
+  # weight pull -- measured at 97.97 s against a ~100 s training step -- and
+  # the cache stopped refreshing entirely: cache_age climbed past 70 s while
+  # availability stayed clamped at 4, AstraFlow submitted nothing, the buffer
+  # drained, and the trainer sat idle at step 116 with sglang itself perfectly
+  # healthy (/health 200, zero requests in flight).
+  #
+  # Static availability removes that coupling: a blocked telemetry poll can no
+  # longer silently gate rollout submission. Re-enable it if weight transfer
+  # moves to delta, where the pull no longer dominates the step.
+  enable_adaptive_availability: false
   target_waiting_queue_per_dp: 4
   adaptive_step_size: 4
   load_cache_ttl_ms: 100
