@@ -84,13 +84,12 @@ raas:
       gconfig:
         n_samples: 8
         temperature: 1.0
-        # ctx-3072: prompt (<=1024) + 2048 new tokens = 3072. Shortened from
-        # 3000 because keeping the KL regulariser (which needs a second copy
-        # of the model) and a 4096-token microbatch do not both fit in 178
-        # GiB -- see the actor mb_spec note for the measurements. This does
-        # truncate the longest reasoning chains; it is a constraint of doing
-        # this on four GPUs, not a modelling choice.
-        max_new_tokens: 2048
+        # ctx-2048: prompt (<=512) + 1536 new tokens = 2048. See the actor
+        # mb_spec note -- this is what the KL regulariser costs on four GPUs.
+        # It truncates the longest reasoning chains, so absolute eval numbers
+        # drop and the step-25 eval is the new baseline; the trend, which is
+        # what says whether training is healthy, stays readable.
+        max_new_tokens: 1536
         min_new_tokens: 0
         # R3: request per-token routed expert indices with every rollout.
         # Requires sglang.enable_return_routed_experts on the RaaS side.
@@ -123,8 +122,8 @@ dataflow:
 
   rollout_dataset:
     dataset_fn: "astraflow.dataflow.dataset.deepscaler:get_deepscaler_rl_dataset"
-    # ctx-4096 bring-up: keep prompts short.
-    max_length: 1024
+    # <=512 so prompt + 1536 generated stays inside the 2048 context.
+    max_length: 512
 
   workflow_spec:
     workflow_cls: "rlvr"
@@ -139,12 +138,12 @@ dataflow:
       gconfig_overrides:
         temperature: 0.6
         n_samples: 1
-        max_new_tokens: 2048
+        max_new_tokens: 1536
 
   eval_datasets:
     math500:
       dataset_fn: "astraflow.dataflow.dataset.math500:get_math500_test_dataset"
-      max_length: 1000
+      max_length: 512
       repeat: 4
       eval_workflow: math_eval
 
@@ -171,18 +170,25 @@ trainer_base:
   actor:
     gradient_checkpointing: true
     mb_spec:
-      # 3072, matching the reduced context_length. The packer requires
-      # max_tokens_per_mb >= the longest sequence, so this value and the
-      # context length move together.
+      # 2048, and it is the context length that forced this. The packer
+      # requires max_tokens_per_mb >= the longest sequence, so microbatch
+      # size and context move together, and per-GPU memory tracks them.
       #
-      # Measured on this hardware with the reference policy present:
-      #   mb 2048 -> 134 GB/GPU (fits, but below the longest sequence)
-      #   mb 4096 -> OOM at 178.34 GiB
+      # Measured on this hardware with the reference policy loaded:
+      #   mb 2048 -> loads (134 GB/GPU before the first step)
+      #   mb 3072 -> OOM at 178.34 GiB
+      #   mb 4096 -> OOM
       #   mb 4608 -> OOM
-      # roughly 21 GB per additional 1024 tokens. Keeping the KL regulariser
-      # therefore costs context: 3072 is the largest budget that leaves the
-      # reference model room on a 183 GB card.
-      max_tokens_per_mb: 3072
+      # At ep=4 every GPU holds 8.789 B parameters twice -- actor and
+      # reference -- plus optimizer state, and nothing else gives the room
+      # back: store_param_remainders is already on by default, and ep cannot
+      # widen past 4 with four ranks.
+      #
+      # So the KL regulariser is paid for in context. That is the right side
+      # of the trade: without it the policy lost 16 points of MATH-500 while
+      # the training reward stayed flat, and a stable short-context run
+      # demonstrates the system where an unstable long-context one does not.
+      max_tokens_per_mb: 2048
     optimizer:
       type: adam
       lr: 5e-6
@@ -246,7 +252,7 @@ trainer_base:
   ref:
     mb_spec:
       # Match the actor; see its mb_spec note.
-      max_tokens_per_mb: 3072
+      max_tokens_per_mb: 2048
 
   recover:
     # disabled, deliberately. Resuming does not work in this setup: a
