@@ -44,11 +44,7 @@ engine:
     data_parallel_size: 2
 
 sglang:
-  # 2048. The trainer holds a reference policy for the KL regulariser, and
-  # its microbatch budget must cover the longest sequence -- 3072 and 4096
-  # both OOMed on a 183 GB card. See experiment_b200_1node.yaml's actor
-  # mb_spec note for the measurements behind this.
-  context_length: 2048
+  context_length: 4096
   # 56.9 GiB of weights on a 183 GB card; 0.85 leaves ample KV headroom.
   mem_fraction_static: 0.85
   # REQUIRED with enable_return_routed_experts: the capturer sizes its

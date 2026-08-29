@@ -84,12 +84,8 @@ raas:
       gconfig:
         n_samples: 8
         temperature: 1.0
-        # ctx-2048: prompt (<=512) + 1536 new tokens = 2048. See the actor
-        # mb_spec note -- this is what the KL regulariser costs on four GPUs.
-        # It truncates the longest reasoning chains, so absolute eval numbers
-        # drop and the step-25 eval is the new baseline; the trend, which is
-        # what says whether training is healthy, stays readable.
-        max_new_tokens: 1536
+        # prompt (<=1024) + 3000 new tokens < 4096.
+        max_new_tokens: 3000
         min_new_tokens: 0
         # R3: request per-token routed expert indices with every rollout.
         # Requires sglang.enable_return_routed_experts on the RaaS side.
@@ -122,8 +118,8 @@ dataflow:
 
   rollout_dataset:
     dataset_fn: "astraflow.dataflow.dataset.deepscaler:get_deepscaler_rl_dataset"
-    # <=512 so prompt + 1536 generated stays inside the 2048 context.
-    max_length: 512
+    # ctx-4096: keep prompts short.
+    max_length: 1024
 
   workflow_spec:
     workflow_cls: "rlvr"
@@ -138,12 +134,12 @@ dataflow:
       gconfig_overrides:
         temperature: 0.6
         n_samples: 1
-        max_new_tokens: 1536
+        max_new_tokens: 3000
 
   eval_datasets:
     math500:
       dataset_fn: "astraflow.dataflow.dataset.math500:get_math500_test_dataset"
-      max_length: 512
+      max_length: 1000
       repeat: 4
       eval_workflow: math_eval
 
@@ -170,28 +166,17 @@ trainer_base:
   actor:
     gradient_checkpointing: true
     mb_spec:
-      # 2048, and it is the context length that forced this. The packer
-      # requires max_tokens_per_mb >= the longest sequence, so microbatch
-      # size and context move together, and per-GPU memory tracks them.
-      #
-      # Measured on this hardware with the reference policy loaded:
-      #   mb 2048 -> loads (134 GB/GPU before the first step)
-      #   mb 3072 -> OOM at 178.34 GiB
-      #   mb 4096 -> OOM
-      #   mb 4608 -> OOM
-      # At ep=4 every GPU holds 8.789 B parameters twice -- actor and
-      # reference -- plus optimizer state, and nothing else gives the room
-      # back: store_param_remainders is already on by default, and ep cannot
-      # widen past 4 with four ranks.
-      #
-      # So the KL regulariser is paid for in context. That is the right side
-      # of the trade: without it the policy lost 16 points of MATH-500 while
-      # the training reward stayed flat, and a stable short-context run
-      # demonstrates the system where an unstable long-context one does not.
-      max_tokens_per_mb: 2048
+      # 4608 = 4096 context + 512 headroom, the value the other recipes use.
+      # This is affordable only because the reference policy is absent; see
+      # kl_penalty_coef.
+      max_tokens_per_mb: 4608
     optimizer:
       type: adam
-      lr: 5e-6
+      # 2e-6, lowered from 5e-6. With no KL anchor the policy drifts, and a
+      # smaller step is the only brake available that costs no memory. If the
+      # eval curve still falls, lr is not the answer and the run needs ep=8
+      # so the regulariser fits.
+      lr: 2e-6
       weight_decay: 0.01
       beta1: 0.9
       beta2: 0.999
@@ -205,17 +190,18 @@ trainer_base:
     reward_scaling: 1
     reward_bias: 0
     kl_ctl: 0.00
-    # RESTORED to the 6-GPU recipe's value after removing it did measurable
-    # damage. Dropping it (to avoid the reference policy's ~16.4 GiB/GPU)
-    # produced a monotonic collapse on MATH-500 -- avg@4 87.59 -> 88.20 ->
-    # 83.35 -> 83.20 -> 79.45 -> 71.50 across evals at steps 25..150 -- while
-    # the training reward stayed flat at ~0.52 and mean response length fell
-    # 2300 -> 1475 tokens. Capability spent, nothing gained: the textbook
-    # signature of a policy drifting with nothing anchoring it.
+    # 0.0 -- NOT because it is unwanted, but because it does not fit. The
+    # regulariser needs a reference policy, a second full copy of the model,
+    # and at ep=4 that OOMs at every usable microbatch size (2048, 3072,
+    # 4096 and 4608 all failed on a 178.34 GiB card). An earlier 134 GB
+    # reading suggested otherwise; it was taken before the first training
+    # step and did not include the training peak.
     #
-    # It fits now because the precision-aware optimizer took steady state from
-    # ~171 GiB to ~127 GiB, leaving room for the reference model.
-    kl_penalty_coef: 0.001
+    # Its absence measurably hurts: MATH-500 avg@4 fell 87.59 -> 71.50 over
+    # 150 steps while the training reward stayed flat and responses shortened
+    # from 2300 to 1475 tokens. Affording it needs ep=8, i.e. eight GPUs for
+    # the trainer, which leaves none on-node for rollout.
+    kl_penalty_coef: 0.0
     ppo_n_minibatches: 4
     reward_norm: { mean_level: group, std_level: group }
     adv_norm: { mean_level: batch, std_level: batch }
@@ -246,13 +232,8 @@ trainer_base:
       # gconfig.return_routed_experts on the rollout side.
       moe_router_replay: true
 
-  # ppo_base.py builds this second copy of the model whenever kl_ctl > 0 or
-  # kl_penalty_coef > 0. It costs ~16.4 GiB/GPU of bf16 parameters plus its
-  # forward pass; see the kl_penalty_coef note for why that is worth paying.
-  ref:
-    mb_spec:
-      # Match the actor; see its mb_spec note.
-      max_tokens_per_mb: 2048
+  # No `ref:` block: with both KL terms at 0 the reference policy is never
+  # constructed. See kl_penalty_coef for why it cannot be afforded here.
 
   recover:
     # disabled, deliberately. Resuming does not work in this setup: a
