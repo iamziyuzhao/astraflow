@@ -99,7 +99,20 @@ dataflow:
     size: 10000
     replay_size: 10000
     replay_ratio: 0
-    max_staleness: 8
+    # 24, not the 6-GPU recipe's 8. With one rollout GPU the queue runs deep
+    # enough that finished trajectories come back ~9 model versions old, and
+    # at max_staleness=8 every one of them was discarded: 34,730 dropped,
+    # cum_accepted frozen, and the trainer sat waiting on an empty buffer
+    # after step 18.
+    #
+    # This is NOT a throughput problem, which is why more rollout GPUs is the
+    # wrong fix -- measured supply was 14.3 sequences/s against a training
+    # demand of 3.3/s, a 4.3x surplus. The data is plentiful, just older than
+    # the window allowed. Widening the window to 24 (2.7x the observed gap)
+    # is also the setting the algorithm is built for: M2PO is a second-moment
+    # trust region for exactly this off-policy case, and R3 is what keeps the
+    # routing consistent across the gap.
+    max_staleness: 24
     filter_function: filter_zero_adv
 
   rollout_dataset:
