@@ -230,7 +230,13 @@ trainer_base:
   # forward pass; see the kl_penalty_coef note for why that is worth paying.
   ref:
     mb_spec:
-      max_tokens_per_mb: 4608
+      # 2048, halved from the 4608 the other recipes use. Restoring the
+      # reference policy costs ~16.4 GiB/GPU of parameters plus a second
+      # forward pass, and at 4608 tokens per microbatch that did not fit --
+      # the card was left with 7.88 MiB free. Smaller microbatches cut the
+      # activation peak for both the actor and the reference forward, at the
+      # cost of more microbatch iterations per step.
+      max_tokens_per_mb: 2048
 
   recover:
     # disabled, deliberately. Resuming does not work in this setup: a
