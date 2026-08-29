@@ -369,6 +369,18 @@ class WeightManager:
 
         result = self._output_queue.get(timeout=120)
         if isinstance(result, tuple):
+            # The agent reports a failed _init as ("__sender_init_error__",
+            # traceback). Without this check the sentinel is unpacked as
+            # (shm_path, buffer_length) and the next line raises
+            # "unsupported operand type(s) for //: 'str' and 'int'" --
+            # every sender-side startup failure surfaced as that TypeError,
+            # with the actual traceback going only to the agent's stderr,
+            # which is not attached to the trainer's log.
+            if result and result[0] == "__sender_init_error__":
+                detail = result[1] if len(result) > 1 else "<no detail>"
+                raise RuntimeError(
+                    f"weight-transfer sender agent failed to start:\n{detail}"
+                )
             # Accept both 2-tuple and 3-tuple (with delta shm path)
             if len(result) == 3:
                 shm_path, buffer_length, _delta_shm = result
