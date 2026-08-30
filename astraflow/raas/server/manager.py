@@ -106,6 +106,14 @@ class RaaS3Manager:
         # race on the same safetensors file (which causes Bus errors
         # in sglang's mmap reader).
         self._weight_update_locks: dict[str, asyncio.Lock] = {}
+        # Newest version each model has been asked to load. A queued request
+        # that is no longer the newest by the time it holds the lock is
+        # skipped: the newest one pulls, and the sender serves its latest
+        # weights regardless of which version was asked for. Without this,
+        # every version is pulled in turn (76 s each at 30B) and the engine
+        # falls a version further behind the trainer on every step that is
+        # shorter than a pull.
+        self._newest_requested_version: dict[str, int] = {}
         # Delta transfer: periodic full sync interval (set during bootstrap).
         # Every N-th step uses full transfer for resync. 0 = never force full.
         self._delta_full_sync_interval: int = 0
@@ -1710,7 +1718,24 @@ class RaaS3Manager:
             lock = asyncio.Lock()
             self._weight_update_locks[model_id] = lock
 
+        newest = self._newest_requested_version.get(model_id, 0)
+        if version > newest:
+            self._newest_requested_version[model_id] = version
+
         async with lock:
+            newest = self._newest_requested_version.get(model_id, version)
+            if version < newest:
+                logger.info(
+                    "notify_version: model=%s v=%d superseded by v=%d while "
+                    "queued, skipping (the newer request pulls)",
+                    model_id, version, newest,
+                )
+                return {
+                    "ok": True,
+                    "model_id": model_id,
+                    "pulled": False,
+                    "reason": f"version={version} superseded by {newest}",
+                }
             return await self._do_weight_update(
                 model_id, version, sender_endpoint,
             )
@@ -1809,8 +1834,24 @@ class RaaS3Manager:
                 flush=True,
             )
 
-        # Update per-model version tracking
-        self._weight_versions[model_id] = version
+        # Update per-model version tracking. Label the engine with the
+        # version the sender actually served, not the one this request
+        # asked for: the sender always serves its latest buffer, so when
+        # requests queue the served weights are newer than the request.
+        # Labelling with the request would stamp every rollout token with
+        # a version that is too low, inflate measured staleness, and let a
+        # staleness cap drop samples that are in fact fresh.
+        loaded = version
+        served = pull_result.get("version")
+        if isinstance(served, int) and not isinstance(served, bool) and served > version:
+            logger.info(
+                "notify_version: model=%s requested v=%d, sender served v=%d; "
+                "engine labelled v=%d",
+                model_id, version, served, served,
+            )
+            loaded = served
+        self._weight_versions[model_id] = loaded
+        version = loaded
         try:
             engine.set_version(version)
         except Exception:

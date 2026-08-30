@@ -269,8 +269,11 @@ class RolloutBuffer:
                 if len(self._heap) == 0:
                     if self.debug:
                         print("RolloutBuffer.get: Buffer is empty, waiting...")
+                    # wait() releases the lock until notified; no sleep here --
+                    # a sleep after the wake would hold the lock and serialise
+                    # every put() and size() behind it while the trainer waits,
+                    # which under a bounded buffer is exactly when they matter.
                     self._not_empty.wait()
-                    time_module.sleep(0.1)
                     continue
 
                 _, _, example, metadata = self._heap[0]

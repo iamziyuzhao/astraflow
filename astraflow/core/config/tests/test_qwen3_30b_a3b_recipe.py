@@ -256,16 +256,22 @@ def test_b200_1node_recipe_closes_the_rollout_loop():
 
     agent = load_dataflow_config(raw)["agent"]
     train_batch_size = raw["trainer_base"]["train_batch_size"]
-    # Buffered half of the loop: one training batch, never less.
-    assert agent["max_buffered_samples"] == 256 == train_batch_size
+    # Buffered half of the loop: two training batches (one would leave no
+    # pipelining: the in-flight tail lands after the gate closes).
+    assert agent["max_buffered_samples"] == 512 == 2 * train_batch_size
     # Safety net behind the gate, not the control; loose enough never to bite.
-    assert agent["max_staleness"] == 8
+    assert agent["max_staleness"] == 12
 
-    # In-flight half of the loop: 64 prompts x 8 samples = 512 sequences.
+    # In-flight half of the loop: 96 prompts x 8 samples = 768 sequences.
     raas_cfg = load_raas_config(raw)
-    assert raas_cfg["rollout"]["max_concurrent_rollouts"] == 64
+    assert raas_cfg["rollout"]["max_concurrent_rollouts"] == 96
     assert raas_cfg["models"]["model0"]["gconfig"]["n_samples"] == 8
-    assert 64 * 8 >= train_batch_size
+    assert 96 * 8 >= train_batch_size
+    # Worst-case outstanding data, in training steps: five, against the
+    # open loop's forty (10,000 buffered + 2,048 in flight).
+    outstanding = agent["max_buffered_samples"] + 96 * 8
+    assert outstanding / train_batch_size <= 5
+    assert agent["max_staleness"] > outstanding / train_batch_size
 
     trainer_dict = load_trainer_config(raw, trainer_key="trainer_model0")
     cfg = to_structured_cfg(OmegaConf.create(trainer_dict), GRPOConfig)

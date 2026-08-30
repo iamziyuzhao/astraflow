@@ -668,6 +668,28 @@ class AstraFlowService:
             "buffer/consumed": float(consume.get("consumed", 0)),
             "buffer/skipped_stale": float(consume.get("skipped_stale", 0)),
         }
+        # Eviction is the open loop's signature: the fresh heap is full and
+        # drops its oldest sample on every put, so the trainer trains on the
+        # oldest survivor. It was counted but never exported; it would have
+        # identified the run A/B mechanism at once.
+        put_stats_fn = getattr(flow.data_serving, "get_and_reset_put_stats", None)
+        if put_stats_fn is not None:
+            try:
+                put_stats = put_stats_fn(model_id)
+            except TypeError:
+                put_stats = put_stats_fn()
+            except Exception:
+                put_stats = {}
+            buffer_stats["buffer/evicted"] = float(put_stats.get("evicted", 0))
+        gate_fn = getattr(flow.data_acquisition, "submit_gate_state", None)
+        if gate_fn is not None:
+            gate = gate_fn()
+            buffer_stats["buffer/submit_gated_ticks"] = float(gate["gated_ticks"])
+            buffer_stats["buffer/submit_gate_closed"] = 1.0 if gate["closed"] else 0.0
+            if gate["max_buffered_samples"] is not None:
+                buffer_stats["buffer/max_buffered_samples"] = float(
+                    gate["max_buffered_samples"]
+                )
         # Length breakdown of consumed vs staleness-dropped samples — the
         # direct signal for the length/difficulty bias that queue_order=edf
         # addresses (long generations expiring more often under fifo).
@@ -1232,25 +1254,29 @@ class AstraFlowService:
             # Step 5: Run eval
             if any_eval:
                 try:
-                    eval_results = self.eval_manager.run_eval(
-                        agent_name, self.raas_pool
-                    )
-                except RuntimeError as e:
-                    if "no healthy RaaS" in str(e):
-                        logger.warning(
-                            "Eval skipped — no healthy RaaS instance: %s", e
+                    try:
+                        eval_results = self.eval_manager.run_eval(
+                            agent_name, self.raas_pool
                         )
-                        print(
-                            f"[{agent_name}:{effective_model_id}] eval SKIPPED "
-                            f"(no healthy RaaS instance)",
-                            flush=True,
-                        )
-                        eval_results = {}
-                    else:
-                        flow.resume()
-                        raise
-                # Step 6: Resume data acquisition
-                flow.resume()
+                    except RuntimeError as e:
+                        if "no healthy RaaS" in str(e):
+                            logger.warning(
+                                "Eval skipped — no healthy RaaS instance: %s", e
+                            )
+                            print(
+                                f"[{agent_name}:{effective_model_id}] eval SKIPPED "
+                                f"(no healthy RaaS instance)",
+                                flush=True,
+                            )
+                            eval_results = {}
+                        else:
+                            raise
+                finally:
+                    # Step 6: Resume data acquisition -- on every exit path.
+                    # A flow left paused by any other exception used to be
+                    # survivable on the open loop's backlog; with a bounded
+                    # buffer the trainer would block at the very next step.
+                    flow.resume()
                 # Accumulate eval wall-clock time for the balance report
                 # so the time-based GPU estimator can subtract it.  Also
                 # invalidate _last_batch_t1 so the next get_batch does

@@ -124,13 +124,13 @@ def test_open_gate_submits_only_the_headroom():
 
 
 def test_headroom_is_divided_by_observed_samples_per_prompt():
-    """80 sequences over 10 ingested results -> 8 per prompt -> ceil(20/8)=3."""
+    """80 accepted sequences over 10 results -> 8 per prompt -> ceil(20/8)=3."""
     rollout = _Rollout(capacity=64)
     backlog = {"n": 0}
     acq = _acquisition(rollout, max_buffered=20, backlog=backlog)
     with acq._stats_lock:
-        acq._ingest_stats["total"] = 80
-        acq._stats["producer_batches"] = 10
+        acq._ingest_stats["accepted"] = 80
+        acq._ingest_stats["results"] = 10
 
     n, _ = acq._submit_tick_debug(256)
 
@@ -142,8 +142,8 @@ def test_headroom_still_submits_at_least_one_prompt():
     backlog = {"n": 19}
     acq = _acquisition(rollout, max_buffered=20, backlog=backlog)
     with acq._stats_lock:
-        acq._ingest_stats["total"] = 800
-        acq._stats["producer_batches"] = 100
+        acq._ingest_stats["accepted"] = 800
+        acq._ingest_stats["results"] = 100
 
     n, _ = acq._submit_tick_debug(256)
 
@@ -336,3 +336,239 @@ def test_loader_without_a_trainer_section_only_checks_positivity():
 def test_loader_leaves_the_gate_unset_by_default():
     raw = _raw({"max_staleness": 8})
     assert load_dataflow_config(raw)["agent"].get("max_buffered_samples") is None
+
+
+# ----------------------------------------------------------------------
+# The loop itself: submit -> generate -> ingest -> train -> resubmit
+# ----------------------------------------------------------------------
+
+
+def _result(n: int, version: int, reward_pattern: str = "mixed") -> dict[str, Any]:
+    """One rollout result: ``n`` sequences stamped with the weight version
+    that generated them. ``mixed`` rewards survive filter_zero_adv; ``flat``
+    ones (all equal) do not."""
+    rewards = [float(i % 2) if reward_pattern == "mixed" else 0.0 for i in range(n)]
+    seqs = [
+        {
+            "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "rewards": torch.tensor([r], dtype=torch.float32),
+            "versions": torch.tensor([[version, version, version]], dtype=torch.long),
+        }
+        for r in rewards
+    ]
+    return {
+        "n_trajs": n,
+        "rewards": torch.tensor(rewards, dtype=torch.float32),
+        "trajectories": [{"sequences": seqs}],
+    }
+
+
+class _LatencyRaaS:
+    """RaaS stand-in with a bounded in-flight pool and a fixed generation
+    latency in ticks. Each completed prompt yields ``n`` sequences stamped
+    with the weight version current when it was submitted."""
+
+    def __init__(self, capacity: int, n_samples: int, latency: int):
+        self.capacity, self.n, self.latency = capacity, n_samples, latency
+        self.version = 1
+        self.tick = 0
+        self.pending: list[tuple[int, int, int]] = []
+        self.next_id = 1
+
+    def get_raas_availability(self) -> dict[str, int]:
+        return {
+            "available": max(0, self.capacity - len(self.pending)),
+            "inflight": len(self.pending),
+        }
+
+    def submit_auto(self, data, workflow_spec=None, **kwargs):
+        del data, workflow_spec, kwargs
+        tid = self.next_id
+        self.next_id += 1
+        self.pending.append((self.tick + self.latency, tid, self.version))
+        return tid
+
+    def advance(self) -> None:
+        self.tick += 1
+
+    def pull_completed(self, max_items: int = 512, timeout: float = 0.0):
+        del timeout
+        done = [p for p in self.pending if p[0] <= self.tick][:max_items]
+        done_ids = {p[1] for p in done}
+        self.pending = [p for p in self.pending if p[1] not in done_ids]
+        return [
+            {"task_id": tid, "ok": True, "result": _result(self.n, v), "error": None}
+            for (_, tid, v) in done
+        ]
+
+
+def _simulate(
+    cap: int | None,
+    *,
+    ticks: int = 300,
+    trainer_period: int = 6,
+    tbs: int = 16,
+    n: int = 4,
+    capacity: int = 8,
+    latency: int = 2,
+) -> dict[str, int]:
+    """Drive the real AstraFlow objects tick by tick.
+
+    Supply is capacity*n/latency = 16 samples per tick; the trainer takes
+    tbs=16 every ``trainer_period`` ticks, so rollout out-supplies training
+    6x -- the shape of the 30B runs.
+    """
+    raas = _LatencyRaaS(capacity, n, latency)
+    flow = AstraFlow(
+        rollout=raas,
+        rollout_dataloader=_Loader(n=100000),
+        workflow_spec={},
+        buffer_size=100000,
+        max_buffered_samples=cap,
+    )
+    acq = flow.data_acquisition
+    version = 1
+    out = {"max_buffered": 0, "max_staleness": 0, "waits": 0, "steps": 0}
+    for t in range(ticks):
+        acq._submit_tick_debug(256)
+        raas.advance()
+        for item in raas.pull_completed():
+            acq._ingest_one_result(item["result"])
+        out["max_buffered"] = max(out["max_buffered"], flow.size())
+        if t % trainer_period == trainer_period - 1:
+            if flow.size() < tbs:
+                out["waits"] += 1
+                continue
+            _, metas = flow.get_training_batch(
+                expected_sample_count=tbs,
+                replay_ratio=0.0,
+                timeout=0.5,
+                current_version=version,
+            )
+            stale = max(version - int(m["min_version"]) for m in metas)
+            out["max_staleness"] = max(out["max_staleness"], stale)
+            version += 1
+            raas.version = version
+            acq.notify_version_changed(version)
+            out["steps"] += 1
+    return out
+
+
+@pytest.fixture
+def no_tick_sleep(monkeypatch):
+    """The submit tick sleeps 0.1 s when gated or idle; not in a simulation."""
+    from astraflow.dataflow import data_acquisition as da_mod
+
+    monkeypatch.setattr(da_mod.time, "sleep", lambda _s: None)
+
+
+def test_closed_loop_bounds_outstanding_samples_and_staleness(no_tick_sleep):
+    tbs, n, capacity = 16, 4, 8
+    cap = 2 * tbs
+    closed = _simulate(cap, tbs=tbs, n=n, capacity=capacity)
+
+    assert closed["steps"] >= 40
+    assert closed["waits"] == 0
+    # Buffered never exceeds the cap plus what was already in flight.
+    assert closed["max_buffered"] <= cap + capacity * n
+    # Staleness is bounded by the outstanding data, in batches, plus one.
+    bound = -(-(cap + capacity * n) // tbs) + 1
+    assert closed["max_staleness"] <= bound
+
+
+def test_open_loop_staleness_grows_without_bound(no_tick_sleep):
+    """The regression the gate exists for: with no cap the buffer fills and
+    edf hands the trainer ever-older samples."""
+    tbs, n, capacity = 16, 4, 8
+    opened = _simulate(None, tbs=tbs, n=n, capacity=capacity)
+    closed = _simulate(2 * tbs, tbs=tbs, n=n, capacity=capacity)
+
+    assert opened["max_buffered"] > 10 * (2 * tbs + capacity * n)
+    assert opened["max_staleness"] > 4 * closed["max_staleness"]
+
+
+def test_gate_reopens_when_the_trainer_drains_the_buffer(no_tick_sleep):
+    rollout = _Rollout(capacity=8)
+    flow = AstraFlow(
+        rollout=rollout,
+        rollout_dataloader=_Loader(),
+        workflow_spec={},
+        max_buffered_samples=4,
+    )
+    acq = flow.data_acquisition
+    assert flow.data_serving.put(_batch(4), {"min_version": 1}, 0.1)
+
+    n, info = acq._submit_tick_debug(256)
+    assert n == 0 and info["gated"] is True
+    gated_before = acq.get_stats()["submit_gated_ticks"]
+
+    out = flow.get_training_batch(
+        expected_sample_count=4, replay_ratio=0.0, timeout=0.5, current_version=2
+    )
+    assert out is not None
+    assert acq._buffered_fn() == 0
+
+    n, info = acq._submit_tick_debug(256)
+    assert n == 4  # headroom 4 / (no ingest yet -> 1 per prompt)
+    assert "gated" not in info
+    assert acq.get_stats()["submit_gated_ticks"] == gated_before
+
+
+def test_samples_per_prompt_is_learned_from_accepted_ingestion():
+    """The estimate divides ACCEPTED sequences by structured results, so a
+    filter that rejects whole groups lowers it, and an upstream-rejected
+    None result does not count as a result at all."""
+    rollout = _Rollout(capacity=64)
+    acq = AstraDataAcquisition(
+        rollout=rollout,
+        rollout_dataloader=_Loader(),
+        workflow_spec={},
+        publish_fn=lambda *a, **k: True,
+        filter_fn="filter_zero_adv",
+        max_buffered_samples=64,
+        buffered_fn=lambda: 0,
+    )
+
+    acq._ingest_one_result(_result(8, version=1, reward_pattern="mixed"))
+    assert acq._tasks_for_headroom(64) == 8  # 8 accepted / 1 result
+
+    acq._ingest_one_result(_result(8, version=1, reward_pattern="flat"))
+    assert acq._tasks_for_headroom(64) == 16  # 8 accepted / 2 results
+
+    acq._ingest_one_result(None)
+    assert acq._tasks_for_headroom(64) == 16  # None is not a result
+
+    stats = acq.get_ingest_stats()
+    assert stats["results"] == 2 and stats["accepted"] == 8 and stats["total"] == 16
+
+
+def test_gate_state_is_exposed_for_the_trainer_stats():
+    rollout = _Rollout(capacity=8)
+    backlog = {"n": 4}
+    acq = _acquisition(rollout, max_buffered=4, backlog=backlog)
+    assert acq.submit_gate_state() == {
+        "closed": False,
+        "gated_ticks": 0,
+        "max_buffered_samples": 4,
+    }
+    acq._submit_tick_debug(256)
+    assert acq.submit_gate_state() == {
+        "closed": True,
+        "gated_ticks": 1,
+        "max_buffered_samples": 4,
+    }
+
+
+def test_multi_model_backlog_is_the_most_backed_up_buffer():
+    flow = AstraFlow(
+        rollout=_Rollout(),
+        rollout_dataloader=_Loader(),
+        workflow_spec={},
+        expected_model_ids=["model0", "model1"],
+        max_buffered_samples=8,
+    )
+    acq = flow.data_acquisition
+    assert acq._buffered_fn() == 0
+    flow.data_serving.buffers["model1"].put(_batch(3), {"min_version": 1}, 0.1)
+    assert acq._buffered_fn() == 3

@@ -15,18 +15,21 @@
 # ============================================================================
 
 rollout:
-  # 64 prompts x 8 samples = 512 sequences generating at once. This is the
-  # in-flight half of the closed loop (the buffered half is
-  # dataflow.buffer.max_buffered_samples in experiment_b200_1node.yaml):
-  # by Little's law a sample's generation latency is in-flight / throughput,
-  # ~512 / 10 seq/s = ~50 s, under one training step. The earlier 256
-  # (2048 sequences) alone put every sample ~2.6 steps behind before it
-  # even reached the buffer. Still plenty for throughput: a 3B-active MoE
-  # saturates one B200 well below 512 concurrent sequences.
+  # 96 prompts x 8 samples = 768 sequences generating at once, spread over
+  # the rollout GPUs (dp=2 -> 384 each). This is the in-flight half of the
+  # closed loop (the buffered half is dataflow.buffer.max_buffered_samples
+  # in experiment_b200_1node.yaml) and it is the SUPPLY bound: a step needs
+  # 256 accepted samples, the zero-advantage filter drops ~40% of groups,
+  # so ~54 prompts must complete per step -- more than half the pool must
+  # turn over inside one step. By Little's law a sample's generation
+  # latency is in-flight / throughput; the earlier 256 (2048 sequences)
+  # alone put every sample ~2.6 steps behind before it reached the buffer.
+  # If timeperf/rollout_wait_fraction stays above 0.2, raise this (128),
+  # never back to 256.
   #
   # Also bounds the R3 routed-experts payload: 48 layers x top-8 int16 is
   # 768 B/token, 3.00 MiB per 4096-token sequence.
-  max_concurrent_rollouts: 64
+  max_concurrent_rollouts: 96
   max_concurrent_evals: 64
   pause_grace_period: 3
   # false. The adaptive controller drives /availability off sglang's load

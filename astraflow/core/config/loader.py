@@ -284,9 +284,22 @@ def _validate_submit_backpressure(agent_fields: dict, raw: dict) -> None:
         raise ValueError(
             f"dataflow.buffer.max_buffered_samples must be positive or null, got {cap}"
         )
-    trainer = raw.get("trainer_base") or raw.get("trainer") or {}
-    tbs = trainer.get("train_batch_size") if isinstance(trainer, dict) else None
-    if tbs is not None and cap < int(tbs):
+    # The largest train_batch_size any trainer section declares: trainer_*
+    # overrides merge on top of trainer_base, and a per-model override may
+    # raise it. Non-numeric values (interpolations) are left to the trainer.
+    tbs = None
+    for key, section in raw.items():
+        if not (key == "trainer" or str(key).startswith("trainer")):
+            continue
+        if not isinstance(section, dict):
+            continue
+        value = section.get("train_batch_size")
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        tbs = value if tbs is None else max(tbs, value)
+    if tbs is not None and cap < tbs:
         raise ValueError(
             f"dataflow.buffer.max_buffered_samples={cap} is below "
             f"train_batch_size={tbs}: the submit gate would close before one "

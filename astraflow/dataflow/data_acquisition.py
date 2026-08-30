@@ -191,6 +191,9 @@ class AstraDataAcquisition:
             "accepted": 0,
             "filtered": 0,
             "total": 0,
+            # Structured results ingested (upstream-rejected None results are
+            # not counted): the denominator of accepted-samples-per-prompt.
+            "results": 0,
         }
         # Curator-side counters (pre-rollout selection). Distinct from
         # ``_ingest_stats`` which counts post-rollout filter outcomes.
@@ -687,6 +690,7 @@ class AstraDataAcquisition:
             self._ingest_stats["total"] += total_seqs
             self._ingest_stats["accepted"] += accepted_seqs
             self._ingest_stats["filtered"] += filtered_seqs
+            self._ingest_stats["results"] += 1
             self._stats["producer_batches"] += 1
         # Track per-RaaS produced/accepted/filtered counts (sequence-level).
         if raas_uid:
@@ -802,16 +806,28 @@ class AstraDataAcquisition:
         """Prompts to submit so their samples roughly fill ``headroom``.
 
         Samples per prompt is not known here (it is the rollout's
-        ``n_samples``), so use the running average of sequences per ingested
-        result. Before anything has been ingested assume one, which only
-        means the first ticks may overshoot by up to RaaS's in-flight cap.
+        ``n_samples``), and the buffer only receives what survives the
+        filter, so use the running average of *accepted* sequences per
+        ingested result. Before anything has been ingested assume one,
+        which only means the first ticks may overshoot by up to RaaS's
+        in-flight cap.
         """
         with self._stats_lock:
-            total = int(self._ingest_stats.get("total", 0))
-            batches = int(self._stats.get("producer_batches", 0))
-        per_task = (total / batches) if batches > 0 and total > 0 else 1.0
+            accepted = int(self._ingest_stats.get("accepted", 0))
+            results = int(self._ingest_stats.get("results", 0))
+        per_task = (accepted / results) if results > 0 and accepted > 0 else 1.0
         per_task = max(1.0, per_task)
         return max(1, int(math.ceil(headroom / per_task)))
+
+    def submit_gate_state(self) -> dict[str, Any]:
+        """Current gate state, for the trainer-facing buffer stats."""
+        with self._stats_lock:
+            gated = int(self._stats.get("submit_gated_ticks", 0))
+        return {
+            "closed": bool(self._submit_gate_closed),
+            "gated_ticks": gated,
+            "max_buffered_samples": self._max_buffered_samples,
+        }
 
     def _note_submit_gate(self, closed: bool, buffered: int) -> None:
         """Log gate transitions once, so a stalled submitter is explainable."""
@@ -1384,6 +1400,7 @@ class AstraDataAcquisition:
             "accepted": 0,
             "filtered": 0,
             "total": 0,
+            "results": 0,
         }
         normalized = dict(default_stats)
         if stats is not None:
