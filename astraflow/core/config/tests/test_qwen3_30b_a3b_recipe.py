@@ -144,3 +144,94 @@ def test_dataflow_config_survives():
     assert agent["expected_model_ids"] == ["model0"]
     assert agent["workflow_spec"]["workflow_cls"] == "rlvr"
     assert agent["tokenizer_path"] == "Qwen/Qwen3-30B-A3B"
+
+
+def _bare_trainer(alloc):
+    """A PPOTrainerBase with __init__ bypassed, for guards that only read config.
+
+    PPOTrainerBase is abstract, so the stubs exist purely to make it
+    instantiable; none of them is called here.
+    """
+    from astraflow.train_worker.trainer.ppo_base import PPOTrainerBase
+
+    class _Concrete(PPOTrainerBase):
+        def _init_rollout(self, *a, **k):  # pragma: no cover - never called
+            raise NotImplementedError
+
+        def prepare_batch_from_buffer(self, *a, **k):  # pragma: no cover
+            raise NotImplementedError
+
+        def train(self, *a, **k):  # pragma: no cover - never called
+            raise NotImplementedError
+
+    trainer = object.__new__(_Concrete)
+    trainer.allocation_mode = alloc
+    return trainer
+
+
+def test_ref_inherits_moe_router_replay_from_actor():
+    """The reference policy must replay the same routing as the actor.
+
+    ``ref`` is a full PPOActorConfig built independently of ``actor``, so
+    ``moe_router_replay`` defaults to False there. With the KL penalty on,
+    that silently computes ref_logp under the reference model's own expert
+    routing while the actor is pinned to the rollout's, making the penalty
+    bound routing divergence as well as parameter drift. The recipe turns the
+    penalty on (kl_penalty_coef=0.001), so this is the configuration that
+    ships.
+    """
+    from astraflow.train_worker.api.cli_args import GRPOConfig, to_structured_cfg
+
+    raw = load_and_merge_configs([str(EXPERIMENT_YAML)])
+    trainer_dict = load_trainer_config(raw, trainer_key="trainer_model0")
+
+    cfg = OmegaConf.create(trainer_dict)
+    cfg = to_structured_cfg(cfg, GRPOConfig)
+    obj = OmegaConf.to_object(cfg)
+
+    # The recipe builds a reference policy at all only because of this.
+    assert obj.actor.kl_penalty_coef > 0 or obj.actor.kl_ctl > 0
+    assert obj.actor.megatron.moe_router_replay is True
+    assert obj.ref is not None
+    assert obj.ref.megatron.moe_router_replay is True
+
+
+def test_ref_yaml_value_overrides_the_inherited_one():
+    """Inheritance fills a gap; it does not overwrite an explicit choice."""
+    raw = load_and_merge_configs([str(EXPERIMENT_YAML)])
+    trainer = raw["trainer_model0"]
+    trainer.setdefault("ref", {}).setdefault("megatron", {})[
+        "moe_router_replay"
+    ] = False
+
+    trainer_dict = load_trainer_config(raw, trainer_key="trainer_model0")
+
+    assert trainer_dict["ref"]["megatron"]["moe_router_replay"] is False
+
+
+def test_actor_replay_with_free_running_ref_is_refused():
+    """An explicit mismatch fails loudly instead of skewing the KL term."""
+    from astraflow.train_worker.api.cli_args import GRPOConfig, to_structured_cfg
+    from astraflow.train_worker.api.alloc_mode import AllocationMode
+
+    raw = load_and_merge_configs([str(EXPERIMENT_YAML)])
+    trainer_dict = load_trainer_config(raw, trainer_key="trainer_model0")
+    cfg = OmegaConf.create(trainer_dict)
+    cfg = to_structured_cfg(cfg, GRPOConfig)
+    obj = OmegaConf.to_object(cfg)
+    obj.ref.megatron.moe_router_replay = False
+
+    trainer = _bare_trainer(AllocationMode.resolve(obj.allocation_mode))
+
+    with pytest.raises(ValueError, match="moe_router_replay"):
+        trainer._assert_ref_replay_matches_actor(obj)
+
+
+def test_ref_replay_guard_ignores_non_megatron_backends():
+    """FSDP has no megatron block to disagree about."""
+    class _Alloc:
+        train_backend = "fsdp"
+
+    trainer = _bare_trainer(_Alloc())
+    # Would raise on attribute access if the backend check did not short-circuit.
+    trainer._assert_ref_replay_matches_actor(object())
