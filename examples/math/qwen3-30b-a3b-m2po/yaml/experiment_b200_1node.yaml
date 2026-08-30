@@ -257,9 +257,12 @@ trainer_base:
   # MATH-500 avg@4 92.25 around step 200 and then eroded, and that peak model
   # was unrecoverable because nothing was being written.
   #
-  # 56.9 GiB per save, so 50 steps (~80 min) rather than every eval.
+  # 56.9 GiB per save. Every 100 steps: 8 saves over the run is 456 GiB,
+  # which is what the staging disk can hold with the supervisor's 200 GB
+  # guard; every 50 would stop writing halfway. The eval curve (every 25)
+  # says which save is the peak.
   saver:
-    freq_steps: 50
+    freq_steps: 100
 
   recover:
     # disabled, deliberately. Resuming does not work in this setup: a
