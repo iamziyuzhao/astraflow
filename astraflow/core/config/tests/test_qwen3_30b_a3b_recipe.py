@@ -279,6 +279,12 @@ def test_b200_1node_recipe_closes_the_rollout_loop():
     assert obj.actor.optimizer.lr == pytest.approx(1e-6)
     assert obj.actor.optimizer.weight_decay == pytest.approx(0.1)
     assert obj.actor.optimizer.beta2 == pytest.approx(0.98)
+    # One Adam step per 256-sample batch, as in both references.
+    assert obj.actor.ppo_n_minibatches == 1
+    # Group-normalised rewards only; no second batch-level advantage norm.
+    assert obj.actor.adv_norm is None
+    assert obj.actor.reward_norm.mean_level == "group"
+    assert obj.actor.reward_norm.std_level == "group"
     # R3 stays on; the closed loop is in addition to replay, not instead.
     assert obj.actor.megatron.moe_router_replay is True
     assert obj.train_batch_size == train_batch_size

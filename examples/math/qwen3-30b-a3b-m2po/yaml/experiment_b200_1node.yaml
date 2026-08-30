@@ -232,9 +232,19 @@ trainer_base:
     # sets --kl-loss-coef 0.00 for this model. The earlier eval declines
     # blamed on its absence tracked sample staleness instead (header).
     kl_penalty_coef: 0.0
-    ppo_n_minibatches: 4
+    # One optimizer step per 256-sample batch, which is what both references
+    # do: miles rolls out 32 x 8 = 256 and takes one step per rollout batch;
+    # the R3 paper's 256 x 8 samples over 8 mini-steps is also 256 per step.
+    # Four minibatches of 64 would apply 4x the Adam updates per sample at
+    # the same lr, and multiply the lag between a sample's behaviour policy
+    # and the policy it updates. Microbatching (mb_spec) still bounds memory.
+    ppo_n_minibatches: 1
+    # GRPO advantages: group-normalised rewards, nothing on top. Both
+    # references stop here; a second batch-level normalisation of already
+    # group-normalised values is close to an identity and is not something
+    # either validated.
     reward_norm: { mean_level: group, std_level: group }
-    adv_norm: { mean_level: batch, std_level: batch }
+    adv_norm: null
     megatron:
       # Fit the optimizer state on a 183 GB card at ep=4 (see the header's
       # measured breakdown). Master weights stay fp32 -- at lr 5e-6 the
