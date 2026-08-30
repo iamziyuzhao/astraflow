@@ -258,8 +258,8 @@ def test_b200_1node_recipe_closes_the_rollout_loop():
     train_batch_size = raw["trainer_base"]["train_batch_size"]
     # Buffered half of the loop: one training batch, never less.
     assert agent["max_buffered_samples"] == 256 == train_batch_size
-    # Safety net behind the gate, not the control.
-    assert agent["max_staleness"] == 4
+    # Safety net behind the gate, not the control; loose enough never to bite.
+    assert agent["max_staleness"] == 8
 
     # In-flight half of the loop: 64 prompts x 8 samples = 512 sequences.
     raas_cfg = load_raas_config(raw)

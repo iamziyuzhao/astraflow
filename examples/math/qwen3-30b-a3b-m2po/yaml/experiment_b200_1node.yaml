@@ -51,20 +51,31 @@
 # is the only thing that shrinks it -- which at world=4 is already maxed.
 #
 # 2026-08-30 -- why this file no longer matches the m2po recipe it lives in.
-# Two runs of the previous version (M2PO, max_staleness 24, open-loop
-# rollout) both improved for ~100-175 steps and then eroded, one of them
-# into a collapse (MATH-500 avg@4 90.4 -> 79.6). Sample staleness explains
-# both: it climbed from ~7 model versions to ~23 as the surplus of rollout
-# over training piled up in the fresh buffer, and the eval turned down in
-# both runs exactly where staleness passed ~17. Neither the saver, the
-# missing KL anchor, nor instability did it (grad_norm flat, seq_len flat).
+# Two runs of the previous version (M2PO, open-loop rollout buffer). Run A
+# rose to MATH-500 avg@4 92.25 at step 200 and then sat near 90 -- within
+# the noise of thirteen evals. Run B rose to 90.35 at step 125 and then fell
+# on every eval, to 79.6 at step 350. Sample staleness -- model versions
+# between a sample's behaviour policy and the trainer -- sat at 7-10 in
+# both while they improved, then plateaued at 20-23; B's plateau came 75
+# steps earlier because its HF save blocks the trainer for minutes while
+# rollout keeps filling the buffer. The plateau is the buffer's capacity
+# over its inflow, not max_staleness (skipped_stale stayed 0): the fresh
+# heap fills, put() evicts the oldest, and edf hands the trainer the oldest
+# survivor, ~22 versions old, every step.
 #
-# So this variant closes the loop and adopts the recipe two independent
-# sources use for this exact model: the R3 paper (arXiv 2510.11370, Qwen3-
-# 30B-A3B: GRPO, clip 0.2/0.27, lr 1e-6, batch 256 x 8, no KL term) and
-# miles's scripts/run_qwen3_30b_a3b.py (GRPO, clip 0.2/0.28, lr 1e-6,
-# weight decay 0.1, beta2 0.98, KL coefficient 0, on-policy). M2PO stays in
-# experiment.yaml; it is not what these two sources validated.
+# Whether 20+ versions of staleness caused B's collapse or accompanied a
+# drift that grows with step count is not settled by two runs (in B, eval
+# tracks step at least as well as staleness). Both readings have the same
+# remedy, the one every synchronous framework gets for free: train on data
+# at most a few versions old. So this variant closes the loop and adopts
+# the recipe two independent sources validated on this exact model: the R3
+# paper (arXiv 2510.11370, Qwen3-30B-A3B: GRPO, clip 0.2/0.27, lr 1e-6,
+# batch 256 x 8, no KL term) and miles's scripts/run_qwen3_30b_a3b.py
+# (GRPO, clip 0.2/0.28, lr 1e-6, weight decay 0.1, beta2 0.98, KL
+# coefficient 0, on-policy). Several things change at once, deliberately:
+# the goal of this run is a model that trains, not an ablation. If it holds
+# its gain, the open-loop GRPO control is the next experiment. M2PO stays
+# in experiment.yaml; it is not what these two sources validated.
 #
 # R3 flags (all three must be on together):
 #   raas.models.model0.gconfig.return_routed_experts  — per-request capture
@@ -116,21 +127,24 @@ dataflow:
     size: 10000
     replay_size: 10000
     replay_ratio: 0
-    # Closed loop. Rollout supplies ~4x what training consumes; without a
-    # gate the surplus accumulates in this buffer and edf hands the trainer
-    # the oldest permissible sample every step, so staleness climbs until it
-    # sits at max_staleness. Two runs eroded exactly as that happened (see
-    # the header). max_buffered_samples pauses prompt submission while one
-    # training batch is already waiting; RaaS's max_concurrent_rollouts (64
-    # prompts x 8 = 512 sequences, raas_b200_1node.yaml) bounds what is in
-    # flight. Outstanding data is therefore <= 768 samples = 3 steps, and
-    # the expected staleness is 1-3 versions, not 23.
+    # Closed loop. Rollout supplies more than training consumes; without a
+    # gate the surplus accumulates here until the heap is full, put() evicts
+    # the oldest, and edf hands the trainer the oldest survivor -- ~22
+    # versions old at size 10000 (see the header). max_buffered_samples
+    # pauses prompt submission while one training batch is already waiting,
+    # so a trainer stall (a 57 GiB save, an eval) no longer deepens the
+    # queue. RaaS's max_concurrent_rollouts (64 prompts x 8 = 512 sequences,
+    # raas_b200_1node.yaml) bounds what is in flight. Outstanding data is
+    # therefore <= 768 samples = 3 steps; expected staleness 1-3 versions.
+    # buffer/buffer_size in the trainer stats should now hover <= ~256.
     #
-    # max_staleness 4 is the safety net behind that, not the control: with
-    # the gate working it should never trigger (buffer/skipped_stale stays
-    # 0). If the trainer logs "Waiting for data" every step, raise
-    # max_buffered_samples to 512 before touching anything else.
-    max_staleness: 4
+    # max_staleness 8 is the safety net behind the gate, not the control:
+    # with the gate working it should never trigger (buffer/skipped_stale
+    # stays 0). Not tighter, because expiring samples hits long generations
+    # first -- the length bias edf exists to remove -- and the gate already
+    # holds staleness far below 8. If the trainer logs "Waiting for data"
+    # every step, raise max_buffered_samples to 512 before anything else.
+    max_staleness: 8
     max_buffered_samples: 256
     filter_function: filter_zero_adv
 
