@@ -23,6 +23,8 @@ RECIPE_DIR = REPO_ROOT / "examples" / "math" / "qwen3-30b-a3b-m2po"
 EXPERIMENT_YAML = RECIPE_DIR / "yaml" / "experiment.yaml"
 RAAS_YAML = RECIPE_DIR / "yaml" / "raas.yaml"
 RAAS_B200_YAML = RECIPE_DIR / "yaml" / "raas_b200.yaml"
+EXPERIMENT_B200_1NODE_YAML = RECIPE_DIR / "yaml" / "experiment_b200_1node.yaml"
+RAAS_B200_1NODE_YAML = RECIPE_DIR / "yaml" / "raas_b200_1node.yaml"
 
 EXPECTED_ENGINE = {
     "backend": "megatron",
@@ -235,3 +237,48 @@ def test_ref_replay_guard_ignores_non_megatron_backends():
     trainer = _bare_trainer(_Alloc())
     # Would raise on attribute access if the backend check did not short-circuit.
     trainer._assert_ref_replay_matches_actor(object())
+
+
+def test_b200_1node_recipe_closes_the_rollout_loop():
+    """The single-node B200 recipe pins the closed-loop, on-policy settings.
+
+    Two runs of the open-loop version eroded exactly as sample staleness
+    climbed to the max_staleness ceiling (see the YAML header). These are the
+    numbers that bound staleness now, plus the GRPO objective the R3 paper
+    and miles validated on this model -- all read through the production
+    loaders so a silent drop or rename fails here, not 100 steps in.
+    """
+    from astraflow.train_worker.api.cli_args import GRPOConfig, to_structured_cfg
+
+    raw = load_and_merge_configs(
+        [str(EXPERIMENT_B200_1NODE_YAML), str(RAAS_B200_1NODE_YAML)]
+    )
+
+    agent = load_dataflow_config(raw)["agent"]
+    train_batch_size = raw["trainer_base"]["train_batch_size"]
+    # Buffered half of the loop: one training batch, never less.
+    assert agent["max_buffered_samples"] == 256 == train_batch_size
+    # Safety net behind the gate, not the control.
+    assert agent["max_staleness"] == 4
+
+    # In-flight half of the loop: 64 prompts x 8 samples = 512 sequences.
+    raas_cfg = load_raas_config(raw)
+    assert raas_cfg["rollout"]["max_concurrent_rollouts"] == 64
+    assert raas_cfg["models"]["model0"]["gconfig"]["n_samples"] == 8
+    assert 64 * 8 >= train_batch_size
+
+    trainer_dict = load_trainer_config(raw, trainer_key="trainer_model0")
+    cfg = to_structured_cfg(OmegaConf.create(trainer_dict), GRPOConfig)
+    obj = OmegaConf.to_object(cfg)
+    # GRPO with decoupled clipping, M2PO off, no KL term (R3 paper / miles).
+    assert obj.actor.m2_threshold is None
+    assert obj.actor.eps_clip == pytest.approx(0.2)
+    assert obj.actor.eps_clip_higher == pytest.approx(0.28)
+    assert obj.actor.kl_penalty_coef == 0.0
+    assert obj.actor.kl_ctl == 0.0
+    assert obj.actor.optimizer.lr == pytest.approx(1e-6)
+    assert obj.actor.optimizer.weight_decay == pytest.approx(0.1)
+    assert obj.actor.optimizer.beta2 == pytest.approx(0.98)
+    # R3 stays on; the closed loop is in addition to replay, not instead.
+    assert obj.actor.megatron.moe_router_replay is True
+    assert obj.train_batch_size == train_batch_size

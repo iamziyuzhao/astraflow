@@ -58,6 +58,7 @@ class AstraFlow:
         curator_args: dict[str, Any] | None = None,
         max_collect_per_tick: int | None = None,
         collect_timeout: float | None = None,
+        max_buffered_samples: int | None = None,
     ):
         """Initialize AstraFlow with acquisition and serving components."""
         self.rollout = rollout
@@ -100,12 +101,26 @@ class AstraFlow:
                 data_serving=self.data_serving,
                 debug=buffer_debug,
                 error_backoff=producer_error_backoff,
+                max_buffered_samples=max_buffered_samples,
+                buffered_fn=self._fresh_backlog,
                 **collect_kwargs,
             )
         self.data_acquisition = data_acquisition
 
         # Compatibility alias for callers expecting direct buffer access.
         self.buffer = getattr(self.data_serving, "buffer", None)
+
+    def _fresh_backlog(self) -> int:
+        """Fresh samples waiting for the trainer, as seen by the submit gate.
+
+        Multi-model serving keeps one buffer per model; the most backed-up
+        one decides, since that is the one whose samples age the longest.
+        """
+        ds = self.data_serving
+        model_ids = getattr(ds, "model_ids", None)
+        if model_ids and len(model_ids) > 1:
+            return max(int(ds.size(mid)) for mid in model_ids)
+        return int(ds.size())
 
     def start(self) -> None:
         """Start data acquisition."""

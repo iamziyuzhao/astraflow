@@ -267,6 +267,35 @@ def load_trainer_config(raw: dict, trainer_key: str | None = None) -> dict:
     return trainer
 
 
+def _validate_submit_backpressure(agent_fields: dict, raw: dict) -> None:
+    """Reject a submit gate that would close before one batch is buffered.
+
+    ``max_buffered_samples`` below ``train_batch_size`` is not a deadlock --
+    prompts already in flight at RaaS still land -- but it starves the
+    trainer on purpose: the gate shuts with less than a batch buffered and
+    only the in-flight tail can top it up. Nothing downstream would flag
+    that; it would just show up as "Waiting for data" every step.
+    """
+    cap = agent_fields.get("max_buffered_samples")
+    if cap is None:
+        return
+    cap = int(cap)
+    if cap <= 0:
+        raise ValueError(
+            f"dataflow.buffer.max_buffered_samples must be positive or null, got {cap}"
+        )
+    trainer = raw.get("trainer_base") or raw.get("trainer") or {}
+    tbs = trainer.get("train_batch_size") if isinstance(trainer, dict) else None
+    if tbs is not None and cap < int(tbs):
+        raise ValueError(
+            f"dataflow.buffer.max_buffered_samples={cap} is below "
+            f"train_batch_size={tbs}: the submit gate would close before one "
+            "training batch is buffered, and the trainer could only be fed by "
+            "rollouts already in flight. Set it to at least train_batch_size "
+            "(1x is near on-policy; 2x tolerates evals and weight-sync pauses)."
+        )
+
+
 def load_dataflow_config(raw: dict) -> dict:
     """Extract AstraFlow dataflow service config.
 
@@ -311,6 +340,10 @@ def load_dataflow_config(raw: dict) -> dict:
         _set_if_missing(agent_fields, "max_staleness", buffer.get("max_staleness"))
         _set_if_missing(agent_fields, "queue_order", buffer.get("queue_order"))
         _set_if_missing(agent_fields, "filter_function", buffer.get("filter_function"))
+        _set_if_missing(
+            agent_fields, "max_buffered_samples", buffer.get("max_buffered_samples")
+        )
+    _validate_submit_backpressure(agent_fields, raw)
 
     # Extract service-level config from agent_fields (they're in the
     # dataflow: YAML section but belong to ServiceConfig, not AgentConfig).

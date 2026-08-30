@@ -50,6 +50,22 @@
 # dp/ep = 1. That un-shardable 7.248 B is what dominates, and widening ep
 # is the only thing that shrinks it -- which at world=4 is already maxed.
 #
+# 2026-08-30 -- why this file no longer matches the m2po recipe it lives in.
+# Two runs of the previous version (M2PO, max_staleness 24, open-loop
+# rollout) both improved for ~100-175 steps and then eroded, one of them
+# into a collapse (MATH-500 avg@4 90.4 -> 79.6). Sample staleness explains
+# both: it climbed from ~7 model versions to ~23 as the surplus of rollout
+# over training piled up in the fresh buffer, and the eval turned down in
+# both runs exactly where staleness passed ~17. Neither the saver, the
+# missing KL anchor, nor instability did it (grad_norm flat, seq_len flat).
+#
+# So this variant closes the loop and adopts the recipe two independent
+# sources use for this exact model: the R3 paper (arXiv 2510.11370, Qwen3-
+# 30B-A3B: GRPO, clip 0.2/0.27, lr 1e-6, batch 256 x 8, no KL term) and
+# miles's scripts/run_qwen3_30b_a3b.py (GRPO, clip 0.2/0.28, lr 1e-6,
+# weight decay 0.1, beta2 0.98, KL coefficient 0, on-policy). M2PO stays in
+# experiment.yaml; it is not what these two sources validated.
+#
 # R3 flags (all three must be on together):
 #   raas.models.model0.gconfig.return_routed_experts  — per-request capture
 #   sglang.enable_return_routed_experts (raas yaml)   — server-side capturer
@@ -59,7 +75,7 @@
 # ── Experiment: identity, model, shared settings ──
 experiment:
   experiment_name: astraflow-math
-  trial_name: qwen3-30b-a3b-m2po-b200
+  trial_name: qwen3-30b-a3b-grpo-onpolicy-b200
   # NOTE: a recover checkpoint here is 285 GB, and old and new coexist during
   # a write, so this needs ~570 GB of headroom. Point it at a filesystem that
   # has it -- on a shared box, filling the one everyone else uses is a real
@@ -100,20 +116,22 @@ dataflow:
     size: 10000
     replay_size: 10000
     replay_ratio: 0
-    # 24, not the 6-GPU recipe's 8. With one rollout GPU the queue runs deep
-    # enough that finished trajectories come back ~9 model versions old, and
-    # at max_staleness=8 every one of them was discarded: 34,730 dropped,
-    # cum_accepted frozen, and the trainer sat waiting on an empty buffer
-    # after step 18.
+    # Closed loop. Rollout supplies ~4x what training consumes; without a
+    # gate the surplus accumulates in this buffer and edf hands the trainer
+    # the oldest permissible sample every step, so staleness climbs until it
+    # sits at max_staleness. Two runs eroded exactly as that happened (see
+    # the header). max_buffered_samples pauses prompt submission while one
+    # training batch is already waiting; RaaS's max_concurrent_rollouts (64
+    # prompts x 8 = 512 sequences, raas_b200_1node.yaml) bounds what is in
+    # flight. Outstanding data is therefore <= 768 samples = 3 steps, and
+    # the expected staleness is 1-3 versions, not 23.
     #
-    # This is NOT a throughput problem, which is why more rollout GPUs is the
-    # wrong fix -- measured supply was 14.3 sequences/s against a training
-    # demand of 3.3/s, a 4.3x surplus. The data is plentiful, just older than
-    # the window allowed. Widening the window to 24 (2.7x the observed gap)
-    # is also the setting the algorithm is built for: M2PO is a second-moment
-    # trust region for exactly this off-policy case, and R3 is what keeps the
-    # routing consistent across the gap.
-    max_staleness: 24
+    # max_staleness 4 is the safety net behind that, not the control: with
+    # the gate working it should never trigger (buffer/skipped_stale stays
+    # 0). If the trainer logs "Waiting for data" every step, raise
+    # max_buffered_samples to 512 before touching anything else.
+    max_staleness: 4
+    max_buffered_samples: 256
     filter_function: filter_zero_adv
 
   rollout_dataset:
@@ -172,35 +190,33 @@ trainer_base:
       max_tokens_per_mb: 4608
     optimizer:
       type: adam
-      # 2e-6, lowered from 5e-6. With no KL anchor the policy drifts, and a
-      # smaller step is the only brake available that costs no memory. If the
-      # eval curve still falls, lr is not the answer and the run needs ep=8
-      # so the regulariser fits.
-      lr: 2e-6
-      weight_decay: 0.01
+      # The R3 paper trains this model at 1e-6 (8 mini-steps) and miles at
+      # 1e-6; the earlier 2e-6 / 5e-6 here were guesses.
+      lr: 1e-6
+      # weight decay 0.1 and beta2 0.98 follow miles's run_qwen3_30b_a3b.py.
+      weight_decay: 0.1
       beta1: 0.9
-      beta2: 0.999
+      beta2: 0.98
       eps: 1e-8
       lr_scheduler_type: constant
       gradient_clipping: 1.0
-    # PPO / M2PO algorithm
-    m2_threshold: 0.01
-    eps_clip: 100.0
-    eps_clip_higher: 100.0
+    # GRPO with decoupled clipping (DAPO "clip-higher"): ratio clamped to
+    # [1 - 0.2, 1 + 0.28]. This is the objective both the R3 paper
+    # (0.2/0.27) and miles (0.2/0.28) validated on Qwen3-30B-A3B. M2PO is
+    # off (m2_threshold null): its clip range is derived from the second
+    # moment and, with near-on-policy data, degenerates to no clipping at
+    # all (eps 0.95/20), which is not a trust region.
+    m2_threshold: null
+    eps_clip: 0.2
+    eps_clip_higher: 0.28
     reward_scaling: 1
     reward_bias: 0
     kl_ctl: 0.00
-    # 0.0 -- NOT because it is unwanted, but because it does not fit. The
-    # regulariser needs a reference policy, a second full copy of the model,
-    # and at ep=4 that OOMs at every usable microbatch size (2048, 3072,
-    # 4096 and 4608 all failed on a 178.34 GiB card). An earlier 134 GB
-    # reading suggested otherwise; it was taken before the first training
-    # step and did not include the training peak.
-    #
-    # Its absence measurably hurts: MATH-500 avg@4 fell 87.59 -> 71.50 over
-    # 150 steps while the training reward stayed flat and responses shortened
-    # from 2300 to 1475 tokens. Affording it needs ep=8, i.e. eight GPUs for
-    # the trainer, which leaves none on-node for rollout.
+    # 0.0. It does not fit at ep=4 (the reference policy is a second full
+    # model copy; every microbatch size OOMed), and it is also not what the
+    # two reference recipes use: the R3 paper omits the KL term and miles
+    # sets --kl-loss-coef 0.00 for this model. The earlier eval declines
+    # blamed on its absence tracked sample staleness instead (header).
     kl_penalty_coef: 0.0
     ppo_n_minibatches: 4
     reward_norm: { mean_level: group, std_level: group }
@@ -262,7 +278,10 @@ trainer_base:
     mode: disabled
 
   evaluator:
-    eval_at_start: false
+    # true: a step-0 MATH-500 reading is the baseline every later eval is
+    # judged against. The two earlier runs skipped it and their first point
+    # (step 25) already carried 25 steps of training.
+    eval_at_start: true
     freq_steps: 25
 
   stats_logger:
@@ -275,4 +294,4 @@ trainer_model0:
   model_id: model0
   stats_logger:
     wandb:
-      tags: ["m2po", "math", "astraflow-v2", "qwen3-30b-a3b", "moe", "tcp", "ctx4k", "full", "megatron", "r3", "b200", "1node"]
+      tags: ["grpo", "clip-higher", "onpolicy", "math", "astraflow-v2", "qwen3-30b-a3b", "moe", "tcp", "ctx4k", "full", "megatron", "r3", "b200", "1node"]

@@ -186,6 +186,7 @@ class AstraFlowService:
             curator_args=agent_config.curator_args,
             max_collect_per_tick=agent_config.max_collect_per_tick,
             collect_timeout=agent_config.collect_timeout,
+            max_buffered_samples=agent_config.max_buffered_samples,
         )
         self.flows[agent_name] = flow
 
