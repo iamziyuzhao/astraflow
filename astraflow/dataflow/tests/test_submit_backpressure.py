@@ -308,7 +308,12 @@ def test_buffer_yaml_key_reaches_the_agent_config():
     agent = load_dataflow_config(raw)["agent"]
     assert agent["max_buffered_samples"] == 512
     assert agent["max_staleness"] == 4
-    assert AgentConfig(**{k: v for k, v in agent.items() if k in AgentConfig.__dataclass_fields__}).max_buffered_samples == 512
+    assert (
+        AgentConfig(
+            **{k: v for k, v in agent.items() if k in AgentConfig.__dataclass_fields__}
+        ).max_buffered_samples
+        == 512
+    )
 
 
 def test_loader_rejects_a_cap_below_the_training_batch():

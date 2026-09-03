@@ -7,8 +7,8 @@ and forwards accepted samples to the serving layer.
 from __future__ import annotations
 
 import logging
-import os
 import math
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -1038,7 +1038,9 @@ class AstraDataAcquisition:
                     with self._stats_lock:
                         self._curator_stats["selected"] += 1
                 if _DEBUG_PRODUCER:
-                    from astraflow.core.workflow.utils.data import resolve_prompt_id as _rpi
+                    from astraflow.core.workflow.utils.data import (
+                        resolve_prompt_id as _rpi,
+                    )
                     _qid = _rpi(data) or "<noid>"
                     global _DEBUG_SUBMIT_COUNTER
                     with _DEBUG_SUBMIT_LOCK:

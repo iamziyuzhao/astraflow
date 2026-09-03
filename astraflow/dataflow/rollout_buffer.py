@@ -257,7 +257,6 @@ class RolloutBuffer:
         empty; returns None only when the buffer is closed.
         """
         del timeout
-        import time as time_module
 
         with self._not_empty:
             while True:

@@ -65,7 +65,11 @@ def _manager(engine: _Engine, served_version) -> RaaS3Manager:
         del endpoint, model_id
         m.pulls.append(len(m.pulls) + 1)
         v = served_version if served_version is not None else None
-        result = {"ok": True, "shm_path": f"/dev/shm/x{len(m.pulls)}", "use_lora": False}
+        result = {
+            "ok": True,
+            "shm_path": f"/dev/shm/x{len(m.pulls)}",
+            "use_lora": False,
+        }
         if v is not None:
             result["version"] = v
         return result
@@ -93,8 +97,12 @@ def test_queued_requests_coalesce_to_the_newest_version():
     # v1 held the lock first and loaded; v2 was superseded by v3 while it
     # queued; v3 loaded. Two pulls, not three.
     assert r1["ok"] and r1.get("pull_result") is not None
-    assert r2 == {"ok": True, "model_id": "model0", "pulled": False,
-                  "reason": "version=2 superseded by 3"}
+    assert r2 == {
+        "ok": True,
+        "model_id": "model0",
+        "pulled": False,
+        "reason": "version=2 superseded by 3",
+    }
     assert r3["ok"] and r3.get("pull_result") is not None
     assert len(m.pulls) == 2
     assert m._weight_versions["model0"] == 3

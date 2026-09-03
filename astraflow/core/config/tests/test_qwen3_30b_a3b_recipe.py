@@ -202,9 +202,9 @@ def test_ref_yaml_value_overrides_the_inherited_one():
     """Inheritance fills a gap; it does not overwrite an explicit choice."""
     raw = load_and_merge_configs([str(EXPERIMENT_YAML)])
     trainer = raw["trainer_model0"]
-    trainer.setdefault("ref", {}).setdefault("megatron", {})[
-        "moe_router_replay"
-    ] = False
+    trainer.setdefault("ref", {}).setdefault("megatron", {})["moe_router_replay"] = (
+        False
+    )
 
     trainer_dict = load_trainer_config(raw, trainer_key="trainer_model0")
 
@@ -213,8 +213,8 @@ def test_ref_yaml_value_overrides_the_inherited_one():
 
 def test_actor_replay_with_free_running_ref_is_refused():
     """An explicit mismatch fails loudly instead of skewing the KL term."""
-    from astraflow.train_worker.api.cli_args import GRPOConfig, to_structured_cfg
     from astraflow.train_worker.api.alloc_mode import AllocationMode
+    from astraflow.train_worker.api.cli_args import GRPOConfig, to_structured_cfg
 
     raw = load_and_merge_configs([str(EXPERIMENT_YAML)])
     trainer_dict = load_trainer_config(raw, trainer_key="trainer_model0")
@@ -231,6 +231,7 @@ def test_actor_replay_with_free_running_ref_is_refused():
 
 def test_ref_replay_guard_ignores_non_megatron_backends():
     """FSDP has no megatron block to disagree about."""
+
     class _Alloc:
         train_backend = "fsdp"
 
