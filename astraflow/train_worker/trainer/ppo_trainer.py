@@ -145,9 +145,14 @@ class AstraFlowPPOTrainer(PPOTrainerBase):
             # notify_version triggers notify_all_versions to pull weights.
             # Drain the delta/no_delta message left by the initial offload
             # so it doesn't shift the queue for subsequent steps.
-            # Use 180s timeout: first delta after recovery compares against
-            # uninitialized buffer and can take ~85s for a 4B model.
-            self.weight_manager.wait_delta_ready(timeout=180.0)
+            # First delta after recovery compares against an uninitialized
+            # buffer and can take ~85s for a 4B model; large MoE models
+            # (e.g. 30B-A3B) need headroom for the ~61 GB sweep.
+            from astraflow.core.weight_manager.weight_manager import (
+                WEIGHT_SYNC_TIMEOUT_SEC,
+            )
+
+            self.weight_manager.wait_delta_ready(timeout=WEIGHT_SYNC_TIMEOUT_SEC)
 
         # Signal readiness — AstraFlow starts data acquisition only
         # after both RaaS and trainer are ready.
