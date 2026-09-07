@@ -29,6 +29,24 @@ class AgentConfig:
     removes the difficulty bias where long generations expire in the queue
     more often than short ones. See RolloutBuffer."""
 
+    max_buffered_samples: int | None = None
+    """Submission back-pressure: pause prompt submission while the fresh
+    buffer already holds at least this many samples.
+
+    Without it the loop is open: rollout capacity beyond what training
+    consumes accumulates in the fresh buffer, and under ``queue_order=edf``
+    the trainer is handed the *oldest* permissible sample every step, so
+    measured staleness climbs until it sits at ``max_staleness``. Two
+    Qwen3-30B-A3B runs improved while staleness stayed under ~10 versions
+    and eroded once it passed ~17. With the gate, outstanding data is
+    bounded by ``max_buffered_samples`` plus what RaaS has in flight
+    (``rollout.max_concurrent_rollouts`` prompts), so staleness stays at a
+    few versions regardless of how fast rollout runs.
+
+    Must be at least the trainer's ``train_batch_size`` (the loader checks).
+    ``None`` (default) keeps the historical open-loop behaviour.
+    """
+
     replay_size: int | None = None
     """Maximum number of samples in the replay buffer."""
 

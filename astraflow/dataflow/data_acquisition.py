@@ -7,6 +7,7 @@ and forwards accepted samples to the serving layer.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -95,10 +96,28 @@ class AstraDataAcquisition:
         debug: bool = False,
         error_backoff: float = 0.5,
         publish_timeout: float | None = 0.1,
+        max_buffered_samples: int | None = None,
+        buffered_fn: Callable[[], int] | None = None,
     ):
         self.rollout = rollout
         self.rollout_dataloader = rollout_dataloader
         self.workflow_spec = workflow_spec
+        # Submission back-pressure. ``buffered_fn`` reports how many fresh
+        # samples are waiting for the trainer; while that is at or above
+        # ``max_buffered_samples`` the submit tick sends nothing. Generation
+        # in flight is bounded separately by RaaS (max_concurrent_rollouts),
+        # so together they cap the data that can age ahead of training.
+        self._max_buffered_samples = (
+            int(max_buffered_samples) if max_buffered_samples is not None else None
+        )
+        if self._max_buffered_samples is not None and self._max_buffered_samples <= 0:
+            raise ValueError(
+                f"max_buffered_samples must be positive or None, got {max_buffered_samples}"
+            )
+        self._buffered_fn = buffered_fn
+        if self._max_buffered_samples is not None and buffered_fn is None:
+            raise ValueError("max_buffered_samples requires a buffered_fn to read the backlog")
+        self._submit_gate_closed = False
 
         self._publish_fn = publish_fn
         self._data_serving = data_serving
@@ -154,6 +173,7 @@ class AstraDataAcquisition:
             "producer_batches": 0,
             "producer_errors": 0,
             "producer_put_failures": 0,
+            "submit_gated_ticks": 0,
         }
         self._submit_executor = ThreadPoolExecutor(max_workers=SUBMIT_CONCURRENCY)
         # Monotonic counter for group_id — each arun_episode result gets a unique id.
@@ -163,6 +183,9 @@ class AstraDataAcquisition:
             "accepted": 0,
             "filtered": 0,
             "total": 0,
+            # Structured results ingested (upstream-rejected None results are
+            # not counted): the denominator of accepted-samples-per-prompt.
+            "results": 0,
         }
         # Curator-side counters (pre-rollout selection). Distinct from
         # ``_ingest_stats`` which counts post-rollout filter outcomes.
@@ -659,6 +682,7 @@ class AstraDataAcquisition:
             self._ingest_stats["total"] += total_seqs
             self._ingest_stats["accepted"] += accepted_seqs
             self._ingest_stats["filtered"] += filtered_seqs
+            self._ingest_stats["results"] += 1
             self._stats["producer_batches"] += 1
         # Track per-RaaS produced/accepted/filtered counts (sequence-level).
         if raas_uid:
@@ -752,6 +776,83 @@ class AstraDataAcquisition:
                 )
                 self._producer_stop.wait(self._error_backoff)
 
+    def _submit_headroom(self) -> tuple[int | None, int]:
+        """Samples the fresh buffer may still absorb before submission pauses.
+
+        Returns ``(headroom, buffered)``; ``headroom`` is None when the gate
+        is not configured (open loop) or the backlog cannot be read, in
+        which case the tick proceeds exactly as before.
+        """
+        if self._max_buffered_samples is None or self._buffered_fn is None:
+            return None, -1
+        try:
+            buffered = int(self._buffered_fn())
+        except Exception:
+            logger.exception(
+                "buffered_fn raised; leaving the submit gate open this tick"
+            )
+            return None, -1
+        return max(0, self._max_buffered_samples - buffered), buffered
+
+    def _tasks_for_headroom(self, headroom: int) -> int:
+        """Prompts to submit so their samples roughly fill ``headroom``.
+
+        Samples per prompt is not known here (it is the rollout's
+        ``n_samples``), and the buffer only receives what survives the
+        filter, so use the running average of *accepted* sequences per
+        ingested result. Before anything has been ingested assume one,
+        which only means the first ticks may overshoot by up to RaaS's
+        in-flight cap.
+        """
+        with self._stats_lock:
+            accepted = int(self._ingest_stats.get("accepted", 0))
+            results = int(self._ingest_stats.get("results", 0))
+        per_task = (accepted / results) if results > 0 and accepted > 0 else 1.0
+        per_task = max(1.0, per_task)
+        return max(1, int(math.ceil(headroom / per_task)))
+
+    def submit_gate_state(self) -> dict[str, Any]:
+        """Current gate state, for the trainer-facing buffer stats."""
+        with self._stats_lock:
+            gated = int(self._stats.get("submit_gated_ticks", 0))
+        return {
+            "closed": bool(self._submit_gate_closed),
+            "gated_ticks": gated,
+            "max_buffered_samples": self._max_buffered_samples,
+        }
+
+    def _note_submit_gate(self, closed: bool, buffered: int) -> None:
+        """Log gate transitions once, so a stalled submitter is explainable."""
+        if closed == self._submit_gate_closed:
+            return
+        self._submit_gate_closed = closed
+        state = "CLOSED" if closed else "open"
+        print(
+            f"[AstraFlow-submit-gate] {state}: buffered={buffered} "
+            f"max_buffered_samples={self._max_buffered_samples}",
+            flush=True,
+        )
+
+    def _apply_submit_gate(self, submit_budget: int, info: dict | None = None) -> int:
+        """Shrink ``submit_budget`` to what the fresh buffer can absorb.
+
+        Returns 0 when the gate is closed (and counts the gated tick).
+        """
+        headroom, buffered = self._submit_headroom()
+        if info is not None:
+            info["buffered"] = buffered
+        if headroom is None:
+            return submit_budget
+        if headroom <= 0:
+            self._note_submit_gate(closed=True, buffered=buffered)
+            with self._stats_lock:
+                self._stats["submit_gated_ticks"] += 1
+            if info is not None:
+                info["gated"] = True
+            return 0
+        self._note_submit_gate(closed=False, buffered=buffered)
+        return min(submit_budget, self._tasks_for_headroom(headroom))
+
     def _submit_one_auto(self, data: dict[str, Any]) -> None:
         """Submit a single sample via submit_auto. Used as a worker target."""
         if self._paused.is_set() or self._producer_stop.is_set():
@@ -789,6 +890,8 @@ class AstraDataAcquisition:
         _dbg_last_submit_ms = 0.0
         _dbg_tick_count = 0
         _dbg_sample_none = 0
+        _dbg_gated = 0
+        _dbg_buffered = -1
 
         while not self._producer_stop.is_set():
             if self._paused.is_set():
@@ -820,9 +923,11 @@ class AstraDataAcquisition:
                     f"last_per_dp_waiting={_dbg_per_dp_snapshot} "
                     f"last_avail_call_ms={_dbg_last_avail_ms:.1f} "
                     f"last_submit_ms={_dbg_last_submit_ms:.1f} "
-                    f"sample_none={_dbg_sample_none}",
+                    f"sample_none={_dbg_sample_none} "
+                    f"gated_ticks={_dbg_gated} buffered={_dbg_buffered}",
                     flush=True,
                 )
+                _dbg_gated = 0
                 _dbg_last_t = _now
                 _dbg_notes = {}
                 _dbg_total_waiting_sum = 0
@@ -848,6 +953,9 @@ class AstraDataAcquisition:
                     _dbg_last_submit_ms = _dbg_info.get("submit_ms", 0.0)
                     if _dbg_info.get("sample_none"):
                         _dbg_sample_none += 1
+                    if _dbg_info.get("gated"):
+                        _dbg_gated += 1
+                    _dbg_buffered = int(_dbg_info.get("buffered", -1))
                 _heartbeat_submitted += _n if _n else 0
                 if _n == 0:
                     _heartbeat_zero_count += 1
@@ -887,6 +995,10 @@ class AstraDataAcquisition:
 
         available_slots = info["available"]
         submit_budget = max(0, min(available_slots, max_submit_per_tick))
+        submit_budget = self._apply_submit_gate(submit_budget, info)
+        if info.get("gated"):
+            time.sleep(0.1)
+            return 0, info
         batch: list[dict[str, Any]] = []
         # Read current version once per tick (curator may use it).
         with self._version_lock:
@@ -987,6 +1099,11 @@ class AstraDataAcquisition:
                 exc_info=True,
             )
             self._producer_stop.wait(self._error_backoff)
+            return 0
+
+        submit_budget = self._apply_submit_gate(submit_budget)
+        if submit_budget <= 0 and self._submit_gate_closed:
+            time.sleep(0.1)
             return 0
 
         # Gather samples first, then submit in parallel.
@@ -1240,6 +1357,7 @@ class AstraDataAcquisition:
                     "producer_batches": 0,
                     "producer_errors": 0,
                     "producer_put_failures": 0,
+                    "submit_gated_ticks": 0,
                 }
         return stats
 
@@ -1248,6 +1366,7 @@ class AstraDataAcquisition:
             "producer_batches": 0,
             "producer_errors": 0,
             "producer_put_failures": 0,
+            "submit_gated_ticks": 0,
         }
         normalized = dict(default_stats)
         if stats is not None:
@@ -1273,6 +1392,7 @@ class AstraDataAcquisition:
             "accepted": 0,
             "filtered": 0,
             "total": 0,
+            "results": 0,
         }
         normalized = dict(default_stats)
         if stats is not None:
