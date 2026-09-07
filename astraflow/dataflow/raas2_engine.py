@@ -59,9 +59,20 @@ class RaaS2InferenceEngine:
         *,
         service_url: str,
         request_timeout: float = 10.0,
+        pull_timeout: float | None = None,
     ):
         self.service_url = service_url.rstrip("/")
         self.request_timeout = min(float(request_timeout), MAX_REQUEST_TIMEOUT_SEC)
+        # HTTP timeout for the collect path (pull_completed / eval_pull).
+        # Pull responses can be much larger than control-plane RPCs — R3
+        # routed-expert payloads are ~384-1536 B/token, so a full pull tick
+        # can carry hundreds of MB — so this is tunable separately.  None
+        # keeps the historical behavior of sharing ``request_timeout``.
+        self.pull_timeout = (
+            self.request_timeout
+            if pull_timeout is None
+            else min(float(pull_timeout), MAX_REQUEST_TIMEOUT_SEC)
+        )
 
         # Transparent workflow registration cache: spec JSON → workflow_id
         self._workflow_cache: dict[str, str] = {}
@@ -110,7 +121,7 @@ class RaaS2InferenceEngine:
         response = requests.post(
             url,
             data=dumps_object(payload),
-            timeout=self.request_timeout,
+            timeout=self.pull_timeout,
             headers={"Content-Type": "application/octet-stream"},
         )
         try:

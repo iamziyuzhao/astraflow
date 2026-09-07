@@ -982,7 +982,9 @@ class RaaSConfig:
     seed: int = field(default=1, metadata={"help": "Random seed."})
     allocation_mode: Any = field(
         default="",
-        metadata={"help": "Engine allocation config. Dict (engine section) or string (legacy)."},
+        metadata={
+            "help": "Engine allocation config. Dict (engine section) or string (legacy)."
+        },
     )
     cluster: ClusterSpecConfig = field(
         default_factory=ClusterSpecConfig,

@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
 #   - WeightManager._BUFFER_READY_ACK_TIMEOUT_SEC (below)
 #   - WeightManager.wait_delta_ready() default (below)
 #   - RaaS3Manager._WEIGHT_UPDATE_GRACE_SEC  (astraflow/raas/server/manager.py)
-#   - AstraFlowPPOTrainer recovery wait_delta_ready() (train_worker/trainer/ppo_trainer.py)
+# TODO(agent): astraflow/train_worker/trainer/ppo_trainer.py still passes a
+# literal 300.0 to wait_delta_ready(); that call site is owned elsewhere and
+# should import WEIGHT_SYNC_TIMEOUT_SEC from this module instead.
 WEIGHT_SYNC_TIMEOUT_SEC = 300.0
 
 _DTYPE_SIZES = {

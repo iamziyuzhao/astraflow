@@ -350,9 +350,13 @@ class SGLangBackend:
         if server_args.get("model_path"):
             self._model_path = server_args["model_path"]
         launch_env = server_args.pop("__launch_env__", None)
-        autopatch = (launch_env or {}).get("ASTRAFLOW_AUTOPATCH", "false").lower() in ("true", "1")
+        autopatch = (launch_env or {}).get("ASTRAFLOW_AUTOPATCH", "false").lower() in (
+            "true",
+            "1",
+        )
         if autopatch:
             from astraflow.raas.api.cli_args import get_py_cmd
+
             cmd = get_py_cmd("astraflow.raas.entrypoint", server_args)
         else:
             cmd = SGLangConfig.build_cmd_from_args(server_args)

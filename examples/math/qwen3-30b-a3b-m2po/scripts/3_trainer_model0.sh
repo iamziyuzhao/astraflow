@@ -1,10 +1,9 @@
 #!/bin/bash
 set -euo pipefail
-# [3/3] Launch Trainer for model0 (Megatron TP1/PP1/DP4/EP4, TCP sender on rank 0)
+# [3/3] Launch Trainer for model0 (Megatron TP2/EP2/DP3, TCP sender on rank 0)
 #
-# Runs on 4 GPUs of the same node as RaaS (see yaml/experiment_b200_1node.yaml).
-# Override the GPU set with TRAINER_MODEL0_GPUS; the world size is the
-# number of GPUs listed and must equal tp * pp * dp of the engine block.
+# Runs on the 6-GPU H200 trainer node. If RaaS runs on a remote node
+# (2b_raas_b200.sh), export ASTRAFLOW_RAAS_URL=http://<b200-host>:19190.
 #
 # Usage (terminal 3, after AstraFlow and RaaS are ready):
 #   bash examples/math/qwen3-30b-a3b-m2po/scripts/3_trainer_model0.sh
@@ -15,13 +14,13 @@ cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 YAML_DIR="${SCRIPT_DIR}/yaml"
-export EXPERIMENT_CONFIG="${EXPERIMENT_CONFIG:-${YAML_DIR}/experiment_b200_1node.yaml}"
+export EXPERIMENT_CONFIG="${EXPERIMENT_CONFIG:-${YAML_DIR}/experiment.yaml}"
 source "${REPO_ROOT}/examples/_common/utils.sh"
 # Export EXP_NAME and TRIAL_NAME from the experiment YAML.
 astraflow_load_experiment_env
 
-# 4 GPUs: world = tp(1) * pp(1) * dp(4) = 4, ep=4 nested in dp.
-export CUDA_VISIBLE_DEVICES="${TRAINER_MODEL0_GPUS:-0,1,2,3}"
+# All 6 GPUs: world = tp(2) * pp(1) * dp(3) = 6, ep=2 nested in dp.
+export CUDA_VISIBLE_DEVICES="${TRAINER_MODEL0_GPUS:-0,1,2,3,4,5}"
 TRAINER0_NPROC="$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F',' '{print NF}')"
 
 export RAAS_PORT="${RAAS_PORT:-19190}"
@@ -35,14 +34,14 @@ export WEIGHT_TRANSFER_HTTP_PORT="${WEIGHT_TRANSFER_HTTP_PORT_MODEL0:-19861}"
 # NCCL / PYTORCH / WANDB tweaks + LOG_DIR. Defined in examples/_common/utils.sh.
 astraflow_setup_env
 
-echo "=== Trainer model0 (TCP, Megatron MoE, R3 replay) ==="
+echo "=== Trainer model0 (TCP, Megatron MoE) ==="
 echo "Experiment config   : ${EXPERIMENT_CONFIG}"
-echo "GPUs                : ${CUDA_VISIBLE_DEVICES} (Megatron TP1/PP1/DP${TRAINER0_NPROC}/EP${TRAINER0_NPROC})"
+echo "GPUs                : ${CUDA_VISIBLE_DEVICES} (Megatron TP2/EP2/DP$((TRAINER0_NPROC / 2)))"
 echo "AstraFlow           : ${ASTRAFLOW_URL}"
 echo "RaaS                : ${ASTRAFLOW_RAAS_URL}"
 echo "Sender HTTP         : ${WEIGHT_TRANSFER_HTTP_PORT}"
 echo "WANDB mode          : ${WANDB_MODE:-online}"
-echo "====================================================="
+echo "=========================================="
 
 torchrun --nnodes 1 --nproc-per-node "${TRAINER0_NPROC}" \
   --master-addr "${MASTER_ADDR:-127.0.0.1}" --master-port "${MASTER_PORT_MODEL0:-29541}" \

@@ -1,9 +1,10 @@
 # ============================================================================
-# Experiment config — single 8xB200 node (trainer + rollout on one box)
+# Experiment config — SINGLE-NODE B200 variant (trainer + rollout on one node)
 # Experiment: math / qwen3-30b-a3b-m2po
 #
-# Trainer and rollout server on the same node, so there is no cross-node
-# weight transfer. Pair with raas_b200_1node.yaml.
+# Use this instead of experiment.yaml when both the trainer and the rollout
+# server live on the same 8xB200 box, so there is no cross-node weight
+# transfer and no SSH tunnel. Pair with raas_b200_1node.yaml.
 #
 # Qwen3-30B-A3B is 30.532 B params, of which 28.991 B (95.0%) are expert
 # weights and 1.541 B are attention + router + embeddings; bf16 is 56.9 GiB.
@@ -12,7 +13,7 @@
 #   TRAINER_MODEL0_GPUS=0,1,2,3      -> Megatron TP=1 PP=1 DP=4 EP=4 ETP=1
 #   SERVICE_CUDA_VISIBLE_DEVICES=4,5 -> RaaS (model0 dp=2, tp=1)
 #
-# Why EP=4 / TP=1 rather than TP=2/EP=2/DP=3 on six GPUs:
+# Why EP=4 / TP=1 rather than the 6-GPU H200 recipe's TP=2/EP=2/DP=3:
 # world = tp * pp * dp must equal the 4 launched ranks, so tp=1/pp=1 gives
 # dp=4, with ep=4 nested inside that DP domain (128 experts / 4 = 32 per
 # rank, an even split). Megatron reports 8,788,850,688 params per rank,
@@ -73,8 +74,8 @@
 # (GRPO, clip 0.2/0.28, lr 1e-6, weight decay 0.1, beta2 0.98, KL
 # coefficient 0, on-policy). Several things change at once, deliberately:
 # the goal of this run is a model that trains, not an ablation. If it holds
-# its gain, the open-loop GRPO control is the next experiment. M2PO is not
-# what these two sources validated and is off here (m2_threshold null).
+# its gain, the open-loop GRPO control is the next experiment. M2PO stays
+# in experiment.yaml; it is not what these two sources validated.
 #
 # R3 flags (all three must be on together):
 #   raas.models.model0.gconfig.return_routed_experts  — per-request capture

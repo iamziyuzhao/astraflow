@@ -54,7 +54,8 @@ def default_data_extract_prompt_fn(data: dict[str, Any]) -> Any:
     # Append solve instruction suffix to user messages
     return [
         {**m, "content": m["content"] + SOLVER_PROMPT_SUFFIX}
-        if m["role"] == "user" else m
+        if m["role"] == "user"
+        else m
         for m in messages
     ]
 

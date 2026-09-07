@@ -96,6 +96,8 @@ class AstraDataAcquisition:
         debug: bool = False,
         error_backoff: float = 0.5,
         publish_timeout: float | None = 0.1,
+        max_collect_per_tick: int = 512,
+        collect_timeout: float = 0.1,
         max_buffered_samples: int | None = None,
         buffered_fn: Callable[[], int] | None = None,
     ):
@@ -153,6 +155,12 @@ class AstraDataAcquisition:
         self._debug = debug
         self._error_backoff = error_backoff
         self._publish_timeout = publish_timeout
+        # Collect-loop knobs. R3 routed-expert payloads are large
+        # (~384-1536 B/token), so deployments with return_routed_experts
+        # enabled may need a smaller tick and/or a larger pull timeout.
+        # Defaults preserve the historical hardcoded values.
+        self._max_collect_per_tick = int(max_collect_per_tick)
+        self._collect_timeout = float(collect_timeout)
         # R3 mixed-batch latch: None until the first non-empty result is
         # ingested, then True/False depending on whether that result
         # carried routed_experts. Later results must agree — otherwise
@@ -1030,7 +1038,9 @@ class AstraDataAcquisition:
                     with self._stats_lock:
                         self._curator_stats["selected"] += 1
                 if _DEBUG_PRODUCER:
-                    from astraflow.core.workflow.utils.data import resolve_prompt_id as _rpi
+                    from astraflow.core.workflow.utils.data import (
+                        resolve_prompt_id as _rpi,
+                    )
                     _qid = _rpi(data) or "<noid>"
                     global _DEBUG_SUBMIT_COUNTER
                     with _DEBUG_SUBMIT_LOCK:
@@ -1141,8 +1151,8 @@ class AstraDataAcquisition:
         return len(batch)
 
     def _collect_loop_raas_service(self) -> None:
-        max_collect_per_tick = 512
-        collect_timeout = 0.1
+        max_collect_per_tick = self._max_collect_per_tick
+        collect_timeout = self._collect_timeout
         _collect_call_count = 0
         _last_heartbeat = time.monotonic()
         _total_ingested = 0

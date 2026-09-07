@@ -13,7 +13,7 @@ cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 YAML_DIR="${SCRIPT_DIR}/yaml"
-export EXPERIMENT_CONFIG="${EXPERIMENT_CONFIG:-${YAML_DIR}/experiment_b200_1node.yaml}"
+export EXPERIMENT_CONFIG="${EXPERIMENT_CONFIG:-${YAML_DIR}/experiment.yaml}"
 source "${REPO_ROOT}/examples/_common/utils.sh"
 # Export EXP_NAME and TRIAL_NAME from the experiment YAML.
 astraflow_load_experiment_env

@@ -69,6 +69,17 @@ _NOTIFY_TIMEOUT_SEC = 660.0
 _AVAILABILITY_TIMEOUT_SEC = 5.0
 _HEARTBEAT_HTTP_TIMEOUT_SEC = 30.0
 
+# Headroom added on top of an engine's own ``pull_timeout`` when waiting on
+# a collect future.  The future wraps *both* the HTTP round-trip and the
+# client-side ``loads_object`` unpickle of the response, so it must outlast
+# the engine's HTTP timeout — otherwise the future fires first and raising
+# ``pull_timeout`` has no effect at all.
+_COLLECT_FUTURE_GRACE_SEC = 5.0
+
+# Floor for the collect future timeout, preserving the historical value for
+# deployments that leave ``pull_timeout`` unset.
+_COLLECT_FUTURE_MIN_SEC = 10.0
+
 # Log routing decisions every N submit_auto calls to avoid spamming logs.
 _SUBMIT_LOG_INTERVAL = 50
 
@@ -88,6 +99,12 @@ class RaaSPool:
     raas_initialize_timeout:
         Maximum seconds to wait for a newly registered RaaS to become ready
         (default 60).
+    pull_timeout:
+        HTTP read timeout handed to every ``RaaS2InferenceEngine`` created by
+        this pool for the collect path (``/pull``).  ``None`` (default) keeps
+        the engine's historical behavior of sharing its control-plane
+        ``request_timeout``.  ``pull_completed`` sizes its own future timeout
+        from this value, so raising it actually widens the collect window.
     """
 
     def __init__(
@@ -95,6 +112,7 @@ class RaaSPool:
         heartbeat_interval: float = 30.0,
         heartbeat_max_failures: int = 10,
         raas_initialize_timeout: float = 60.0,
+        pull_timeout: float | None = None,
     ) -> None:
         self._engines: dict[str, RaaS2InferenceEngine] = {}  # uid -> engine
         self._lock = threading.RLock()
@@ -116,6 +134,7 @@ class RaaSPool:
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_max_failures = heartbeat_max_failures
         self._raas_initialize_timeout = raas_initialize_timeout
+        self._pull_timeout = None if pull_timeout is None else float(pull_timeout)
 
         self._submit_count = 0  # for periodic routing log
 
@@ -207,7 +226,9 @@ class RaaSPool:
             raas_url,
             self._raas_initialize_timeout,
         )
-        engine = RaaS2InferenceEngine(service_url=raas_url)
+        engine = RaaS2InferenceEngine(
+            service_url=raas_url, pull_timeout=self._pull_timeout
+        )
         engine.initialize(max_wait=self._raas_initialize_timeout, verbose=True)
 
         # Add to pool immediately.  The new RaaS gets weights via the
@@ -637,6 +658,33 @@ class RaaSPool:
 
         return engine.submit_auto(data, workflow_spec)
 
+    @staticmethod
+    def _collect_future_timeout(
+        timeout: float,
+        engines: list[tuple[str, RaaS2InferenceEngine]],
+    ) -> float:
+        """Seconds to wait on a collect future, sized from the engines polled.
+
+        A collect future covers the engine's HTTP round-trip *and* the
+        client-side unpickle of the response, so it has to outlast the
+        engine's own ``pull_timeout``.  Waiting for exactly the HTTP
+        timeout (the old hardcoded 10.0) meant the future always expired
+        first, so raising ``pull_timeout`` for large R3 payloads had no
+        effect whatsoever.
+        """
+        engine_pull_timeout = max(
+            (
+                float(getattr(engine, "pull_timeout", 0.0) or 0.0)
+                for _, engine in engines
+            ),
+            default=0.0,
+        )
+        return max(
+            timeout + _COLLECT_FUTURE_GRACE_SEC,
+            _COLLECT_FUTURE_MIN_SEC,
+            engine_pull_timeout + _COLLECT_FUTURE_GRACE_SEC,
+        )
+
     def pull_completed(
         self,
         max_items: int = 256,
@@ -655,7 +703,7 @@ class RaaSPool:
 
         n = max(1, len(engines))
         per_instance_max = max(1, max_items // n)
-        collect_timeout = max(timeout + 5.0, 10.0)
+        collect_timeout = self._collect_future_timeout(timeout, engines)
 
         futs = {
             uid: self._executor.submit(
@@ -675,9 +723,23 @@ class RaaSPool:
                 per_uid_counts[uid] = len(items)
                 results.extend(items)
             except Exception:
+                # TODO(agent): DATA LOSS WINDOW.  The RaaS server pops
+                # results out of ``_completed_results`` before it writes
+                # the response (RaaS3Manager._drain_completed), so any
+                # tick that fails here — future timeout, HTTP error, or
+                # unpickle failure — permanently drops every rollout it
+                # carried; there is no retry and no server-side redelivery.
+                # Sizing collect_timeout from the engine's pull_timeout
+                # (see _collect_future_timeout) shrinks the window but
+                # cannot close it.  The complete fix is a server-protocol
+                # change: have /pull lease results (peek + explicit ack,
+                # or re-queue on lease expiry) instead of popping them,
+                # and have this handler nack so they are redelivered.
                 per_uid_counts[uid] = -1  # -1 signals error
                 logger.warning(
-                    "RaaSPool: pull_completed failed for uid=%s", uid
+                    "RaaSPool: pull_completed failed for uid=%s "
+                    "(results popped server-side for this tick are lost)",
+                    uid,
                 )
                 self._mark_suspect(uid, "pull_completed")
 
