@@ -55,6 +55,12 @@ class ModelResponse:
     output_tokens: list[int] = field(default_factory=list)
     output_logprobs: list[float] = field(default_factory=list)
     output_versions: list[int] = field(default_factory=list)
+    # R3: per-token MoE routed expert indices recorded during rollout.
+    # int16 array of shape [total_seq_len - 1, num_moe_layers, top_k]; row t
+    # holds the expert ids used by the forward that consumed position t
+    # (positions 0..total_seq_len-2; the final position is never forwarded
+    # during rollout). None when R3 is disabled.
+    output_routed_experts: np.ndarray | None = None
     stop_reason: Literal["length", "stop", "interrupt"] = "stop"
     # tokenizer is used for encode-decode in the inference engine
     tokenizer: PreTrainedTokenizerFast | None = None

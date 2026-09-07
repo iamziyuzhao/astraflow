@@ -104,15 +104,17 @@ def concat_padded_tensors(
                 if key == "attention_mask":
                     # Pad attention mask with 0s
                     padding = torch.zeros(
-                        (tensor.shape[0], pad_width),
+                        (tensor.shape[0], pad_width, *tensor.shape[2:]),
                         dtype=tensor.dtype,
                         device=tensor.device,
                     )
 
                 else:
-                    # Pad feature tensors with pad_value
+                    # Pad feature tensors with pad_value; keep trailing dims so
+                    # ND [batch, seq, ...] tensors (e.g. routed_experts) pad
+                    # correctly. 2D behavior is unchanged.
                     padding = torch.full(
-                        (tensor.shape[0], pad_width),
+                        (tensor.shape[0], pad_width, *tensor.shape[2:]),
                         pad_value,
                         dtype=tensor.dtype,
                         device=tensor.device,

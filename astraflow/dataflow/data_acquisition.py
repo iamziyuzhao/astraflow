@@ -134,6 +134,12 @@ class AstraDataAcquisition:
         self._debug = debug
         self._error_backoff = error_backoff
         self._publish_timeout = publish_timeout
+        # R3 mixed-batch latch: None until the first non-empty result is
+        # ingested, then True/False depending on whether that result
+        # carried routed_experts. Later results must agree — otherwise
+        # concat_padded_tensors would KeyError long after the fact.
+        self._routed_experts_expected: bool | None = None
+        self._routed_experts_lock = threading.Lock()
 
         self._producer_thread: threading.Thread | None = None
         self._submit_thread: threading.Thread | None = None
@@ -376,6 +382,87 @@ class AstraDataAcquisition:
             return -1
         return int(positive[0].item())
 
+    def _validate_routed_experts(self, sequences: list[dict[str, Any]]) -> None:
+        """Validate per-sequence R3 ``routed_experts`` tensors before publish.
+
+        This is the single validation point on the ingest path.  Each
+        ``routed_experts`` entry must be an int16 torch tensor of shape
+        ``[1, seq_len, num_moe_layers, top_k]`` where ``seq_len`` matches the
+        sequence's ``input_ids``.  Mixing sequences (or whole results) with
+        and without ``routed_experts`` is rejected here with a precise error
+        instead of surfacing later as a KeyError inside
+        ``concat_padded_tensors``.
+        """
+        if not sequences:
+            return
+        with_experts = [i for i, seq in enumerate(sequences) if "routed_experts" in seq]
+        if with_experts and len(with_experts) != len(sequences):
+            missing = sorted(set(range(len(sequences))) - set(with_experts))
+            raise ValueError(
+                f"Mixed rollout result: sequences {with_experts} carry "
+                f"'routed_experts' but sequences {missing} do not. All "
+                "sequences of a result must consistently include or omit "
+                "routed_experts (is return_routed_experts enabled on every "
+                "rollout engine?)."
+            )
+
+        has_experts = bool(with_experts)
+        with self._routed_experts_lock:
+            expected = self._routed_experts_expected
+            if expected is None:
+                self._routed_experts_expected = has_experts
+            elif expected != has_experts:
+                raise ValueError(
+                    "Mixed rollout stream: earlier results "
+                    f"{'carried' if expected else 'lacked'} 'routed_experts' "
+                    f"but this result {'lacks' if expected else 'carries'} it. "
+                    "All rollout engines must agree on return_routed_experts "
+                    "for the whole run — mixed batches would otherwise fail "
+                    "later in concat_padded_tensors."
+                )
+        if not has_experts:
+            return
+
+        for i, seq in enumerate(sequences):
+            experts = seq["routed_experts"]
+            if not torch.is_tensor(experts):
+                raise TypeError(
+                    f"routed_experts of sequence {i} must be a torch tensor, "
+                    f"got {type(experts)}."
+                )
+            if experts.dtype != torch.int16:
+                raise ValueError(
+                    f"routed_experts of sequence {i} must have dtype "
+                    f"torch.int16, got {experts.dtype}."
+                )
+            if experts.ndim != 4:
+                raise ValueError(
+                    f"routed_experts of sequence {i} must have ndim == 4 "
+                    "([1, seq_len, num_moe_layers, top_k]), got shape "
+                    f"{tuple(experts.shape)}."
+                )
+            if experts.shape[0] != 1:
+                raise ValueError(
+                    f"routed_experts of sequence {i} must have batch dim 1, "
+                    f"got shape {tuple(experts.shape)}."
+                )
+            input_ids = seq.get("input_ids")
+            if not torch.is_tensor(input_ids) or input_ids.ndim < 2:
+                raise ValueError(
+                    f"Sequence {i} carries 'routed_experts' but has no "
+                    "[1, seq_len] 'input_ids' tensor to validate its length "
+                    "against."
+                )
+            seq_len = int(input_ids.shape[1])
+            if experts.shape[1] != seq_len:
+                raise ValueError(
+                    f"routed_experts of sequence {i} covers "
+                    f"{int(experts.shape[1])} positions but input_ids has "
+                    f"seq_len {seq_len}; expected shape "
+                    "[1, seq_len, num_moe_layers, top_k] with one row per "
+                    "token position."
+                )
+
     def _ingest_structured_result(
         self,
         result: dict[str, Any],
@@ -438,6 +525,10 @@ class AstraDataAcquisition:
                 seq["group_id"] = torch.tensor([group_id], dtype=torch.long)
                 seq["prompt_id"] = prompt_id_str
                 all_sequences.append(seq)
+
+        # Single validation point for R3 routed_experts on the ingest path:
+        # fail fast with a precise message before anything is published.
+        self._validate_routed_experts(all_sequences)
 
         # Group sequences by model.
         model_groups: dict[int, list[dict[str, Any]]] = {}

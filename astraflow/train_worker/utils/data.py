@@ -220,9 +220,10 @@ def concat_padded_tensors(
                     )
 
                 else:
-                    # Pad feature tensors with pad_value
+                    # Pad feature tensors with pad_value, preserving trailing
+                    # dims (e.g. routed_experts [B, S, num_moe_layers, top_k])
                     padding = torch.full(
-                        (tensor.shape[0], pad_width),
+                        (tensor.shape[0], pad_width, *tensor.shape[2:]),
                         pad_value,
                         dtype=tensor.dtype,
                         device=tensor.device,
@@ -515,9 +516,14 @@ def split_padded_tensor_dict_into_mb_list(
         if key in multimodal_keys:
             continue
         if key == "position_ids" or (
-            torch.is_tensor(value) and value.numel() == bs * max_seqlen
+            torch.is_tensor(value)
+            and value.ndim >= 2
+            and value.shape[:2] == (bs, max_seqlen)
         ):
-            # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3
+            # NOTE: shape-based check so per-token tensors with trailing dims
+            # (e.g. routed_experts [B, S, num_moe_layers, top_k]) are split by
+            # row instead of duplicated into every micro-batch. qwen2.5-vl
+            # position_ids ([bs, max_seqlen, 3]) keeps its explicit key check.
             to_split[key] = value
         else:
             not_to_split[key] = value
@@ -678,9 +684,13 @@ def pad_packed_tensor_dict(
                             new_end - new_start, dtype=value.dtype, device=value.device
                         )
                 sequence_padded_data[key] = new_value
-            elif torch.is_tensor(value) and value.numel() == total_length:
+            elif (
+                torch.is_tensor(value)
+                and value.ndim >= 1
+                and value.shape[0] == total_length
+            ):
                 new_value = torch.full(
-                    padded_shape,
+                    (padded_shape[0], *value.shape[1:]),
                     fill_value=pad_value,
                     dtype=value.dtype,
                     device=value.device,
@@ -737,11 +747,16 @@ def pad_packed_tensor_dict(
                 pad = torch.arange(pad_length, dtype=torch.long, device=value.device)
                 padded_tensor = torch.cat([value, pad])
             padded_data[key] = padded_tensor
-        elif torch.is_tensor(value) and value.numel() == total_length:
-            # Pad the tensor to the new total length
-            padded_tensor = torch.nn.functional.pad(
-                value, (0, pad_length), value=pad_value
-            )
+        elif (
+            torch.is_tensor(value)
+            and value.ndim >= 1
+            and value.shape[0] == total_length
+        ):
+            # Pad the first (token) dim to the new total length; trailing dims
+            # (e.g. routed_experts [total_length, num_moe_layers, top_k]) are
+            # left untouched.
+            pad_spec = (0, 0) * (value.ndim - 1) + (0, pad_length)
+            padded_tensor = torch.nn.functional.pad(value, pad_spec, value=pad_value)
             padded_data[key] = padded_tensor
         else:
             padded_data[key] = value
@@ -870,7 +885,8 @@ def unsqueeze_packed_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
                 "max_seqlen",
             ]
             and torch.is_tensor(value)
-            and value.numel() == total_length
+            and value.ndim >= 1
+            and value.shape[0] == total_length
         ):
             new_data[key] = value.unsqueeze(dim=0)
         else:
@@ -903,6 +919,30 @@ def amend_position_ids(data: dict) -> dict:
     position_ids.masked_fill(~attn_mask.bool(), 0)
     data["position_ids"] = position_ids
     return data
+
+
+# NCCL has no int16 datatype, so `dist.broadcast`/`dist.all_gather` on an
+# int16 tensor raises "Input tensor data type is not supported for NCCL
+# process group: Short". The R3 routed-expert masks are int16 on purpose --
+# 48 layers x top-8 is 768 B/token at 2 bytes/entry, half what int32 costs,
+# and a 4096-token sequence is then exactly 3.00 MiB -- so they have to
+# cross a process group reinterpreted as a same-width supported dtype.
+# Both collectives are pure copies (no reduction arithmetic), so every bit
+# pattern round-trips exactly, including ones that are NaN as bfloat16.
+_NCCL_WIRE_DTYPE = {torch.int16: torch.bfloat16}
+
+
+def _nccl_wire_view(tensor: torch.Tensor) -> torch.Tensor:
+    """View `tensor` as a dtype NCCL can carry, sharing its storage.
+
+    Returns the tensor unchanged for every dtype NCCL already supports.
+    The result aliases the input, so a collective writing into the view
+    fills the original tensor.
+    """
+    wire = _NCCL_WIRE_DTYPE.get(tensor.dtype)
+    if wire is None:
+        return tensor
+    return tensor.view(wire)
 
 
 def broadcast_tensor(tensor: torch.Tensor | None, src_rank=0, group=None):
@@ -943,7 +983,7 @@ def broadcast_tensor(tensor: torch.Tensor | None, src_rank=0, group=None):
 
         # Broadcast the actual tensor
         tensor = tensor.contiguous()
-        dist.broadcast(tensor, src=src_rank, group=group)
+        dist.broadcast(_nccl_wire_view(tensor), src=src_rank, group=group)
 
         return tensor
     else:
@@ -963,8 +1003,9 @@ def broadcast_tensor(tensor: torch.Tensor | None, src_rank=0, group=None):
         # Create tensor with the received shape and dtype
         tensor = torch.empty(tensor_shape, dtype=dtype, device=device)
 
-        # Receive the actual tensor data
-        dist.broadcast(tensor, src=src_rank, group=group)
+        # Receive the actual tensor data. The view aliases `tensor`, so the
+        # received bytes land in it directly.
+        dist.broadcast(_nccl_wire_view(tensor), src=src_rank, group=group)
 
         return tensor
 
@@ -991,7 +1032,9 @@ def all_gather_tensor_container(data, group=None) -> list:
         y = _flatten_pad_to_max_numel(data, shapes)
 
         ys = [torch.empty_like(y) for _ in range(dist.get_world_size(group=group))]
-        dist.all_gather(ys, y, group=group)
+        dist.all_gather(
+            [_nccl_wire_view(o) for o in ys], _nccl_wire_view(y), group=group
+        )
 
         return [_unpad_unflatten(y, shape) for y, shape in zip(ys, shapes)]
 
