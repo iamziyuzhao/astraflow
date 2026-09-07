@@ -91,6 +91,7 @@ class PPOTrainerBase(abc.ABC):
             (config.actor.kl_ctl > 0 or config.actor.kl_penalty_coef > 0)
             and config.ref is not None
         ):
+            self._assert_ref_replay_matches_actor(config)
             self.ref = self._create_actor(config.ref)
 
         self.train_dataset = train_dataset
@@ -168,6 +169,38 @@ class PPOTrainerBase(abc.ABC):
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _assert_ref_replay_matches_actor(self, config) -> None:
+        """Refuse an R3 actor paired with a free-running reference policy.
+
+        The KL-to-reference penalty is applied token-wise between the actor's
+        logprobs and ``ref_logp``. Under R3 the actor's forward is pinned to
+        the routing the rollout recorded, so if the reference engine does not
+        replay as well its routers pick their own experts and the KL measures
+        routing divergence on top of the parameter drift it exists to bound.
+
+        Nothing downstream notices: the reference engine simply builds no
+        replay context, its routers free-run, and ``ref_logp`` comes back a
+        plausible tensor. ``config.ref`` is a full ``PPOActorConfig`` built
+        independently of ``config.actor``, so the mismatch is what you get by
+        default -- the loader now inherits the flag, and this catches a value
+        set explicitly. Note that ``ref`` needs no rollout-side change: it
+        consumes the same ``routed_experts`` tensor already on the batch.
+        """
+        if self.allocation_mode.train_backend != "megatron":
+            return
+        actor_replay = config.actor.megatron.moe_router_replay
+        ref_replay = config.ref.megatron.moe_router_replay
+        if actor_replay and not ref_replay:
+            raise ValueError(
+                "actor.megatron.moe_router_replay=True but "
+                "ref.megatron.moe_router_replay=False. The reference policy "
+                "would compute ref_logp with its own MoE routing while the "
+                "actor replays the rollout's, so the KL penalty would bound "
+                "routing divergence as well as parameter drift -- silently. "
+                "Set ref.megatron.moe_router_replay=True, or turn off R3 "
+                "replay on the actor as well."
+            )
 
     def _create_actor(self, actor_config: PPOActorConfig):
         if self.allocation_mode.train_backend == "fsdp":

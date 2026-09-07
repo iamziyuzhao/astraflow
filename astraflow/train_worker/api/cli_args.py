@@ -182,6 +182,16 @@ class GenerationHyperparameters:
             "help": "Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored."
         },
     )
+    return_routed_experts: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "request per-token MoE routed expert indices from the rollout "
+                "engine (R3); requires an SGLang server launched with "
+                "enable_return_routed_experts."
+            )
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -238,6 +248,7 @@ class GenerationHyperparameters:
         "lora_name",  # Not supported by OpenAI
         "use_beam_search",  # Not supported by OpenAI
         "max_tokens",  # deprecated by "completions", not used in "responses", should be `max_new_tokens` in "openai-agents"
+        "return_routed_experts",  # Not supported by OpenAI
     }
 
     def to_openai_args_dict(
@@ -446,6 +457,15 @@ class MegatronEngineConfig:
     # will produce the same output. However, it may have a performance impact.
     # It is recommended to set this option to True for RL training on MoE models for stability.
     use_deterministic_algorithms: bool = False
+
+    moe_router_replay: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "replay rollout-recorded MoE routing during training forwards (R3)."
+            )
+        },
+    )
 
     # Gradient checkpointing options, only effective when gradient_checkpointing=True
     recompute_granularity: str | None = "full"

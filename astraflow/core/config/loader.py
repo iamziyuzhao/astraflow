@@ -140,6 +140,21 @@ def _auto_propagate_trainer(
     _set_if_missing(ref, "disable_dropout", True)
     _set_if_missing(ref, "optimizer", None)
 
+    # R3: the reference policy must evaluate the same expert routing as every
+    # other forward in the objective. `ref` is a full PPOActorConfig built
+    # independently of `actor`, so megatron.moe_router_replay defaults to False
+    # there even when the actor replays -- and nothing would complain. The KL
+    # penalty would then compare the actor evaluated on the rollout's routing
+    # against a reference free-running its own, so the term would measure
+    # routing divergence on top of the parameter drift it is meant to bound.
+    # Inherit the actor's setting; an explicit value in `ref` still wins.
+    _actor_mcore = actor.get("megatron") or {}
+    if _actor_mcore.get("moe_router_replay"):
+        _ref_mcore = ref.get("megatron")
+        if _ref_mcore is None:
+            _ref_mcore = ref["megatron"] = {}
+        _set_if_missing(_ref_mcore, "moe_router_replay", True)
+
     # -- cluster --
     if "cluster" not in trainer:
         trainer["cluster"] = {}
