@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
+import numpy as np
 from PIL.Image import Image as ImageObject
 from transformers import PreTrainedTokenizerFast
 
@@ -55,6 +56,11 @@ class ModelResponse:
     output_tokens: list[int] = field(default_factory=list)
     output_logprobs: list[float] = field(default_factory=list)
     output_versions: list[int] = field(default_factory=list)
+    # R3: int16 array of logical MoE expert ids, shape
+    # [total_seq_len - 1, num_moe_layers, top_k]; row t = experts used by
+    # the forward that consumed position t (the final position is never
+    # forwarded during rollout). None when R3 is disabled.
+    output_routed_experts: np.ndarray | None = None
     stop_reason: Literal["length", "stop", "interrupt"] = "stop"
     # tokenizer is used for encode-decode in the inference engine
     tokenizer: PreTrainedTokenizerFast | None = None
@@ -93,6 +99,10 @@ class HttpGenerationResult:
     output_tokens: list[int]
     output_logprobs: list[float]
     stop_reason: str
+    # R3: int16 array [rows, num_moe_layers, top_k] of logical expert ids
+    # covering positions [start_len, total_seq_len - 1). None when the
+    # request did not ask for routed experts or was aborted before prefill.
+    routed_experts: np.ndarray | None = None
 
 
 @dataclass

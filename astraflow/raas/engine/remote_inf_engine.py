@@ -15,6 +15,7 @@ from threading import Lock
 from typing import Any, Protocol
 
 import aiohttp
+import numpy as np
 import requests
 import torch.distributed as dist
 import uvloop
@@ -148,7 +149,7 @@ class RemoteInfBackendProtocol(Protocol):
     """
 
     def build_generation_request(
-        self, req: ModelRequest, with_lora: bool
+        self, req: ModelRequest, with_lora: bool, routed_experts_start_len: int = 0
     ) -> HttpRequest:
         """Build HTTP request for text generation.
 
@@ -158,6 +159,9 @@ class RemoteInfBackendProtocol(Protocol):
             The generation request containing input and parameters
         with_lora : bool
             Whether to specify a LoRA to use
+        routed_experts_start_len : int
+            First sequence position to capture routed experts for (R3).
+            Only used when ``req.gconfig.return_routed_experts`` is set.
 
         Returns
         -------
@@ -602,6 +606,13 @@ class RemoteInfEngine:
         accumulated_output_tokens = []
         accumulated_output_logprobs = []
         accumulated_versions = []
+        # R3: routed-expert chunks accumulated across interrupt/resume
+        # iterations. Chunk i covers positions
+        # [routed_experts_rows_before_i, len(req.input_ids) - 1) of the
+        # sequence at that iteration (half-open, so the boundary position is
+        # recaptured by the next iteration's prefill).
+        accumulated_routed_experts: list[np.ndarray] = []
+        routed_experts_rows = 0
 
         # A single "rid" shares the same server to allow KV cache reuse
         if req.rid in self.rid_to_address:
@@ -654,7 +665,15 @@ class RemoteInfEngine:
                     f"agenerate() building HTTP request, rid={req.rid}, "
                     f"iteration={iteration}, server_addr={server_addr}"
                 )
-                http_req = self.backend.build_generation_request(req, self.lora_initialized)
+                # First iteration: start_len=0 (capture the full sequence).
+                # Later iterations: start at the row count accumulated so
+                # far, i.e. len(req.input_ids) - 1 — recapturing the boundary
+                # position the previous chunk's half-open range excluded.
+                http_req = self.backend.build_generation_request(
+                    req,
+                    self.lora_initialized,
+                    routed_experts_start_len=routed_experts_rows,
+                )
 
                 # Loop until the generation is complete
                 logger.debug(
@@ -670,9 +689,13 @@ class RemoteInfEngine:
                     max_retries=self.config.request_retries,
                     timeout=self.config.request_timeout,
                 )
+                # NOTE: no response_size here. f-string args are evaluated even
+                # when debug logging is off, and with R3 the response carries a
+                # base64 routing blob (~2 KB per token, MBs per sequence), so
+                # len(str(result)) cost ~10 ms per response on the shared loop.
                 logger.debug(
                     f"agenerate() received HTTP response, rid={req.rid}, "
-                    f"iteration={iteration}, response_size={len(str(result))}"
+                    f"iteration={iteration}"
                 )
 
                 # Parse response using backend
@@ -685,6 +708,9 @@ class RemoteInfEngine:
                 accumulated_versions.extend(
                     [self.get_version()] * len(gen_result.output_tokens)
                 )
+                if gen_result.routed_experts is not None:
+                    accumulated_routed_experts.append(gen_result.routed_experts)
+                    routed_experts_rows += gen_result.routed_experts.shape[0]
 
                 # Update request for next iteration
                 req.input_ids += gen_result.output_tokens
@@ -707,6 +733,23 @@ class RemoteInfEngine:
 
             latency = time.perf_counter() - start_time
 
+            output_routed_experts = None
+            if accumulated_routed_experts:
+                output_routed_experts = np.concatenate(
+                    accumulated_routed_experts, axis=0
+                )
+                # Rows must cover positions 0..total_seq_len-2 (the final
+                # position is never forwarded during rollout). A mismatch
+                # means a chunk was captured incompletely — fail fast rather
+                # than train on misaligned routing.
+                if output_routed_experts.shape[0] != len(req.input_ids) - 1:
+                    raise RuntimeError(
+                        f"Accumulated routed-expert rows "
+                        f"({output_routed_experts.shape[0]}) do not cover all "
+                        f"forwarded positions ({len(req.input_ids) - 1}) for "
+                        f"rid={req.rid}."
+                    )
+
             response = ModelResponse(
                 input_tokens=req.input_ids[
                     : len(req.input_ids) - len(accumulated_output_tokens)
@@ -715,6 +758,7 @@ class RemoteInfEngine:
                 output_tokens=accumulated_output_tokens,
                 output_logprobs=accumulated_output_logprobs,
                 output_versions=accumulated_versions,
+                output_routed_experts=output_routed_experts,
                 stop_reason=stop_reason,
                 latency=latency,
                 ttft=latency,  # Simplified for non-streaming
