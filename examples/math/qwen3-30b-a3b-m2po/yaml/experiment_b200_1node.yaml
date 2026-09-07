@@ -1,0 +1,332 @@
+# ============================================================================
+# Experiment config — single 8xB200 node (trainer + rollout on one box)
+# Experiment: math / qwen3-30b-a3b-m2po
+#
+# Trainer and rollout server on the same node, so there is no cross-node
+# weight transfer. Pair with raas_b200_1node.yaml.
+#
+# Qwen3-30B-A3B is 30.532 B params, of which 28.991 B (95.0%) are expert
+# weights and 1.541 B are attention + router + embeddings; bf16 is 56.9 GiB.
+#
+# GPU layout (6 GPUs on one node):
+#   TRAINER_MODEL0_GPUS=0,1,2,3      -> Megatron TP=1 PP=1 DP=4 EP=4 ETP=1
+#   SERVICE_CUDA_VISIBLE_DEVICES=4,5 -> RaaS (model0 dp=2, tp=1)
+#
+# Why EP=4 / TP=1 rather than TP=2/EP=2/DP=3 on six GPUs:
+# world = tp * pp * dp must equal the 4 launched ranks, so tp=1/pp=1 gives
+# dp=4, with ep=4 nested inside that DP domain (128 experts / 4 = 32 per
+# rank, an even split). Megatron reports 8,788,850,688 params per rank,
+# which is the 28.991 B of experts split 4 ways (7.248 B) plus the 1.541 B
+# of non-expert weights, replicated at TP=1.
+#
+# Per-GPU memory, measured rather than assumed -- a first attempt at pure
+# fp32 optimizer state OOMed at 171.4 GiB of the card's 178.3 GiB, in
+# fused_adam._initialize_state (Adam allocates its moments lazily on the
+# first step(), so forward and backward had already succeeded):
+#
+#                            fp32 (OOMs)   with the settings below
+#   bf16 params                 16.4 GiB          16.4 GiB
+#   DDP grad buffer             32.7 GiB          16.4 GiB   (bf16)
+#   fp32 master (shard)         28.4 GiB          28.4 GiB
+#   exp_avg (shard)             28.4 GiB          14.2 GiB   (bf16)
+#   exp_avg_sq (shard)          28.4 GiB          14.2 GiB   (bf16)
+#                              ---------         ---------
+#   steady state               134.3 GiB          89.6 GiB
+#   + activations, NCCL,
+#     fragmentation (obs.)      ~37   GiB         ~37   GiB
+#                              ---------         ---------
+#                              ~171   GiB        ~127   GiB
+#
+# A middle attempt keeping exp_avg_sq and the DDP buffer in fp32 still
+# OOMed at 157.7 GiB allocated -- the DDP gradient buffer is owned by
+# ddp.grad_reduce_in_fp32, not by the optimizer's main_grads_dtype, so
+# setting only the latter saved almost nothing.
+#
+# The "shard" rows are smaller than the full parameter count because the
+# distributed optimizer shards each parameter over ITS OWN data-parallel
+# group: the 1.541 B non-expert params shard over dp=4, but the expert
+# params do not shard at all, because the expert data-parallel group is
+# dp/ep = 1. That un-shardable 7.248 B is what dominates, and widening ep
+# is the only thing that shrinks it -- which at world=4 is already maxed.
+#
+# 2026-08-30 -- why this file no longer matches the m2po recipe it lives in.
+# Two runs of the previous version (M2PO, open-loop rollout buffer). Run A
+# rose to MATH-500 avg@4 92.25 at step 200 and then sat near 90 -- within
+# the noise of thirteen evals. Run B rose to 90.35 at step 125 and then fell
+# on every eval, to 79.6 at step 350. Sample staleness -- model versions
+# between a sample's behaviour policy and the trainer -- sat at 7-10 in
+# both while they improved, then plateaued at 20-23; B's plateau came 75
+# steps earlier because its HF save blocks the trainer for minutes while
+# rollout keeps filling the buffer. The plateau is the buffer's capacity
+# over its inflow, not max_staleness (skipped_stale stayed 0): the fresh
+# heap fills, put() evicts the oldest, and edf hands the trainer the oldest
+# survivor, ~22 versions old, every step.
+#
+# Whether 20+ versions of staleness caused B's collapse or accompanied a
+# drift that grows with step count is not settled by two runs (in B, eval
+# tracks step at least as well as staleness). Both readings have the same
+# remedy, the one every synchronous framework gets for free: train on data
+# at most a few versions old. So this variant closes the loop and adopts
+# the recipe two independent sources validated on this exact model: the R3
+# paper (arXiv 2510.11370, Qwen3-30B-A3B: GRPO, clip 0.2/0.27, lr 1e-6,
+# batch 256 x 8, no KL term) and miles's scripts/run_qwen3_30b_a3b.py
+# (GRPO, clip 0.2/0.28, lr 1e-6, weight decay 0.1, beta2 0.98, KL
+# coefficient 0, on-policy). Several things change at once, deliberately:
+# the goal of this run is a model that trains, not an ablation. If it holds
+# its gain, the open-loop GRPO control is the next experiment. M2PO is not
+# what these two sources validated and is off here (m2_threshold null).
+#
+# R3 flags (all three must be on together):
+#   raas.models.model0.gconfig.return_routed_experts  — per-request capture
+#   sglang.enable_return_routed_experts (raas yaml)   — server-side capturer
+#   trainer_base.actor.megatron.moe_router_replay     — trainer-side replay
+# ============================================================================
+
+# ── Experiment: identity, model, shared settings ──
+experiment:
+  experiment_name: astraflow-math
+  trial_name: qwen3-30b-a3b-grpo-onpolicy-b200
+  # NOTE: a recover checkpoint here is 285 GB, and old and new coexist during
+  # a write, so this needs ~570 GB of headroom. Point it at a filesystem that
+  # has it -- on a shared box, filling the one everyone else uses is a real
+  # hazard, not just a failed run.
+  fileroot: ./data-experiments/${experiment.experiment_name}/${experiment.trial_name}
+
+  model_path: "Qwen/Qwen3-30B-A3B"
+  tokenizer_path: "Qwen/Qwen3-30B-A3B"
+  seed: 1
+  dtype: bfloat16
+  weight_transfer_mode: tcp
+  # Full sync (not delta) for MoE bring-up: MoE per-step delta density is
+  # unmeasured, and a delta overflowing the pre-allocated buffer permanently
+  # falls back to full anyway. Revisit after measuring.
+  weight_transfer_strategies: full
+
+# ── RaaS: what to generate (inference-level config) ──
+raas:
+  models:
+    model0:
+      backend: sglang
+      gconfig:
+        n_samples: 8
+        temperature: 1.0
+        # prompt (<=1024) + 3000 new tokens < 4096.
+        max_new_tokens: 3000
+        min_new_tokens: 0
+        # R3: request per-token routed expert indices with every rollout.
+        # Requires sglang.enable_return_routed_experts on the RaaS side.
+        return_routed_experts: true
+
+# ── AstraFlow: data pipeline ──
+dataflow:
+  host: "0.0.0.0"
+  port: 8000
+
+  buffer:
+    size: 10000
+    replay_size: 10000
+    replay_ratio: 0
+    # Closed loop. Rollout supplies more than training consumes; without a
+    # gate the surplus accumulates here until the heap is full, put() evicts
+    # the oldest, and edf hands the trainer the oldest survivor -- ~22
+    # versions old at size 10000 (see the header). max_buffered_samples
+    # pauses prompt submission while two training batches are already
+    # waiting, so a trainer stall (a 57 GiB save, an eval) no longer deepens
+    # the queue. Two batches rather than one: the gate ignores what is in
+    # flight, so at exactly one batch the in-flight tail lands after the
+    # gate closes and rollout then idles for a whole step -- no pipelining.
+    # RaaS's max_concurrent_rollouts (96 prompts x 8 = 768 sequences,
+    # raas_b200_1node.yaml) bounds what is in flight. Outstanding data is
+    # therefore <= 1280 samples = 5 steps worst case; expected staleness
+    # 2-4 versions. buffer/evicted must stay 0 and buffer/buffer_size is
+    # sampled after each pull, so expect it to alternate rather than sit.
+    #
+    # max_staleness 12 is the safety net behind the gate, not the control:
+    # with the gate working it should never trigger (buffer/skipped_stale
+    # stays 0). Not tighter, because (a) expiring samples hits long
+    # generations first -- the length bias edf exists to remove -- and (b)
+    # the rollout engine's weight loads take ~76 s each and queue behind
+    # one another; they are now coalesced to the newest version and
+    # labelled with the version actually served, but a cap that bites on a
+    # transient lag would drain the buffer and starve the trainer, which is
+    # the exact stall the first attempt hit at max_staleness 8. If the
+    # trainer logs "Waiting for data" every step, raise max_concurrent_
+    # rollouts (in-flight is the supply bound), not this.
+    max_staleness: 12
+    max_buffered_samples: 512
+    filter_function: filter_zero_adv
+
+  rollout_dataset:
+    dataset_fn: "astraflow.dataflow.dataset.deepscaler:get_deepscaler_rl_dataset"
+    # ctx-4096: keep prompts short.
+    max_length: 1024
+
+  workflow_spec:
+    workflow_cls: "rlvr"
+    reward_fn: "math_verify"
+    enable_thinking: false
+
+  eval_workflows:
+    math_eval:
+      workflow_cls: "rlvr"
+      reward_fn: "math_verify"
+      enable_thinking: false
+      gconfig_overrides:
+        temperature: 0.6
+        n_samples: 1
+        max_new_tokens: 3000
+
+  eval_datasets:
+    math500:
+      dataset_fn: "astraflow.dataflow.dataset.math500:get_math500_test_dataset"
+      max_length: 1000
+      repeat: 4
+      eval_workflow: math_eval
+
+# ── Trainer base: shared config ──
+trainer_base:
+  total_train_steps: 800
+  # Must be divisible by dp_world_size * group_size = 4 * 8 = 32 so the
+  # zero-adv filter and DP redistribute stay clean (see
+  # ppo_trainer._filter_zero_adv_in_batch). 240 is NOT (240/32 = 7.5);
+  # 256 = 8 * 32 is the nearest workable size.
+  train_batch_size: 256
+  n_samples: 8
+  # Megatron training backend for the MoE model. 4-GPU trainer:
+  # world = tp * pp * dp = 1 * 1 * 4; ep=4 nests inside the dp domain and
+  # divides 128 experts evenly (32 per rank).
+  engine:
+    backend: megatron
+    data_parallel_size: 4
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    expert_parallel_size: 4
+    expert_tensor_parallel_size: 1
+
+  actor:
+    gradient_checkpointing: true
+    mb_spec:
+      # 4608 = 4096 context + 512 headroom, the value the other recipes use.
+      # This is affordable only because the reference policy is absent; see
+      # kl_penalty_coef.
+      max_tokens_per_mb: 4608
+    optimizer:
+      type: adam
+      # The R3 paper trains this model at 1e-6 (8 mini-steps) and miles at
+      # 1e-6; the earlier 2e-6 / 5e-6 here were guesses.
+      lr: 1e-6
+      # weight decay 0.1 and beta2 0.98 follow miles's run_qwen3_30b_a3b.py.
+      weight_decay: 0.1
+      beta1: 0.9
+      beta2: 0.98
+      eps: 1e-8
+      lr_scheduler_type: constant
+      gradient_clipping: 1.0
+    # GRPO with decoupled clipping (DAPO "clip-higher"): ratio clamped to
+    # [1 - 0.2, 1 + 0.28]. This is the objective both the R3 paper
+    # (0.2/0.27) and miles (0.2/0.28) validated on Qwen3-30B-A3B. M2PO is
+    # off (m2_threshold null): its clip range is derived from the second
+    # moment and, with near-on-policy data, degenerates to no clipping at
+    # all (eps 0.95/20), which is not a trust region.
+    m2_threshold: null
+    eps_clip: 0.2
+    eps_clip_higher: 0.28
+    reward_scaling: 1
+    reward_bias: 0
+    kl_ctl: 0.00
+    # 0.0. It does not fit at ep=4 (the reference policy is a second full
+    # model copy; every microbatch size OOMed), and it is also not what the
+    # two reference recipes use: the R3 paper omits the KL term and miles
+    # sets --kl-loss-coef 0.00 for this model. The earlier eval declines
+    # blamed on its absence tracked sample staleness instead (header).
+    kl_penalty_coef: 0.0
+    # One optimizer step per 256-sample batch, which is what both references
+    # do: miles rolls out 32 x 8 = 256 and takes one step per rollout batch;
+    # the R3 paper's 256 x 8 samples over 8 mini-steps is also 256 per step.
+    # Four minibatches of 64 would apply 4x the Adam updates per sample at
+    # the same lr, and multiply the lag between a sample's behaviour policy
+    # and the policy it updates. Microbatching (mb_spec) still bounds memory.
+    ppo_n_minibatches: 1
+    # GRPO advantages: group-normalised rewards, nothing on top. Both
+    # references stop here; a second batch-level normalisation of already
+    # group-normalised values is close to an identity and is not something
+    # either validated.
+    reward_norm: { mean_level: group, std_level: group }
+    adv_norm: null
+    megatron:
+      # Fit the optimizer state on a 183 GB card at ep=4 (see the header's
+      # measured breakdown). Master weights stay fp32 -- at lr 5e-6 the
+      # update is far below bf16 resolution -- and so does exp_avg_sq,
+      # whose small variance accumulations are the most precision-
+      # sensitive. The gradient buffer and first moment go to bf16, which
+      # is where the 30 GiB comes from.
+      use_precision_aware_optimizer: true
+      main_params_dtype: float32
+      main_grads_dtype: bfloat16
+      exp_avg_dtype: bfloat16
+      exp_avg_sq_dtype: bfloat16
+      ddp:
+        # Separate knob from main_grads_dtype, and the one that actually
+        # owns the big buffer: main_grads_dtype is the optimizer's view,
+        # while DDP allocates the gradient *accumulation* buffer over the
+        # full 8.789 B params. Leaving it fp32 kept 32.7 GiB resident and
+        # made the first precision-aware attempt save only ~3 GiB.
+        grad_reduce_in_fp32: false
+      # Recommended for RL on MoE models: identical inputs must produce
+      # identical forwards, and the R3 replay equivalence gate depends on it.
+      use_deterministic_algorithms: true
+      # R3: replay the rollout-recorded routing in every training forward
+      # (prox logp, ref logp, ppo_update). Requires
+      # gconfig.return_routed_experts on the rollout side.
+      moe_router_replay: true
+
+  # No `ref:` block: with both KL terms at 0 the reference policy is never
+  # constructed. See kl_penalty_coef for why it cannot be afforded here.
+
+  # HF-format weight export, which is SEPARATE from `recover` below and does
+  # not depend on the broken distributed-checkpoint load path. Without it a
+  # run produces no durable artifact at all: the first attempt peaked at
+  # MATH-500 avg@4 92.25 around step 200 and then eroded, and that peak model
+  # was unrecoverable because nothing was being written.
+  #
+  # 56.9 GiB per save. Every 100 steps: 8 saves over the run is 456 GiB,
+  # which is what the staging disk can hold with the supervisor's 200 GB
+  # guard; every 50 would stop writing halfway. The eval curve (every 25)
+  # says which save is the peak.
+  saver:
+    freq_steps: 100
+
+  recover:
+    # disabled, deliberately. Resuming does not work in this setup: a
+    # complete 285 GB checkpoint (8 .distcp shards plus metadata, written
+    # cleanly at step 99) fails to load with
+    #     AttributeError: 'Metadata' object has no attribute 'mcore_data'
+    # -- the saved distributed-checkpoint metadata lacks the field Megatron's
+    # reader expects, so this is a save/load format mismatch rather than a
+    # damaged file.
+    #
+    # With loading broken, checkpoints are write-only: 285 GB and roughly 9%
+    # of step time spent producing something that cannot be read back. Until
+    # the format mismatch is fixed, not writing them is strictly better, and
+    # the trade is that a crash restarts from step 0 rather than losing at
+    # most 20 steps.
+    mode: disabled
+
+  evaluator:
+    # true: a step-0 MATH-500 reading is the baseline every later eval is
+    # judged against. The two earlier runs skipped it and their first point
+    # (step 25) already carried 25 steps of training.
+    eval_at_start: true
+    freq_steps: 25
+
+  stats_logger:
+    wandb:
+      mode: online
+      id_suffix: "uid"
+
+# ── Trainer for model0 — only overrides ──
+trainer_model0:
+  model_id: model0
+  stats_logger:
+    wandb:
+      tags: ["grpo", "clip-higher", "onpolicy", "math", "astraflow-v2", "qwen3-30b-a3b", "moe", "tcp", "ctx4k", "full", "megatron", "r3", "b200", "1node"]

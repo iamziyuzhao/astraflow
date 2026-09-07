@@ -1,0 +1,82 @@
+# ============================================================================
+# RaaS config — SINGLE-NODE B200 variant (rollout beside the trainer)
+# Experiment: math / qwen3-30b-a3b-m2po
+#
+# Hardware: 2 of the 8 B200s on the same box as the trainer.
+#   model0:  DP=2, TP=1  — one full 56.9 GiB bf16 replica per GPU, leaving
+#            ~120 GiB per GPU for KV at mem_fraction_static 0.85.
+#
+# Launch with:
+#   --config experiment_b200_1node.yaml --config raas_b200_1node.yaml
+#
+# Same node as the trainer, so weight sync never leaves the box: no SSH
+# tunnel, no cross-node hostname resolution, and the ~57 GiB full sync is a
+# loopback transfer rather than a node-link one.
+# ============================================================================
+
+rollout:
+  # 96 prompts x 8 samples = 768 sequences generating at once, spread over
+  # the rollout GPUs (dp=2 -> 384 each). This is the in-flight half of the
+  # closed loop (the buffered half is dataflow.buffer.max_buffered_samples
+  # in experiment_b200_1node.yaml) and it is the SUPPLY bound: a step needs
+  # 256 accepted samples, the zero-advantage filter drops ~40% of groups,
+  # so ~54 prompts must complete per step -- more than half the pool must
+  # turn over inside one step. By Little's law a sample's generation
+  # latency is in-flight / throughput; the earlier 256 (2048 sequences)
+  # alone put every sample ~2.6 steps behind before it reached the buffer.
+  # If timeperf/rollout_wait_fraction stays above 0.2, raise this (128),
+  # never back to 256.
+  #
+  # Also bounds the R3 routed-experts payload: 48 layers x top-8 int16 is
+  # 768 B/token, 3.00 MiB per 4096-token sequence.
+  max_concurrent_rollouts: 96
+  max_concurrent_evals: 64
+  pause_grace_period: 3
+  # false. The adaptive controller drives /availability off sglang's load
+  # telemetry, and after a weight update it wipes its snapshot and repopulates
+  # from a cached poll. At 30B that poll is competing with a full 56.9 GiB
+  # weight pull -- measured at 97.97 s against a ~100 s training step -- and
+  # the cache stopped refreshing entirely: cache_age climbed past 70 s while
+  # availability stayed clamped at 4, AstraFlow submitted nothing, the buffer
+  # drained, and the trainer sat idle at step 116 with sglang itself perfectly
+  # healthy (/health 200, zero requests in flight).
+  #
+  # Static availability removes that coupling: a blocked telemetry poll can no
+  # longer silently gate rollout submission. Re-enable it if weight transfer
+  # moves to delta, where the pull no longer dominates the step.
+  enable_adaptive_availability: false
+  target_waiting_queue_per_dp: 4
+  adaptive_step_size: 4
+  load_cache_ttl_ms: 100
+
+engine:
+  model0:
+    backend: sglang
+    data_parallel_size: 2
+
+sglang:
+  context_length: 4096
+  # 56.9 GiB of weights on a 183 GB card; 0.85 leaves ample KV headroom.
+  mem_fraction_static: 0.85
+  # REQUIRED with enable_return_routed_experts: the capturer sizes its
+  # device buffer as max(chunked_prefill_size, max_running_requests) rows
+  # per DP rank. AstraFlow's default -1 (unchunked) undersizes it and any
+  # prefill batch larger than max_running_requests tokens crashes
+  # mid-forward. 32768 = max_prefill_tokens, so nothing actually chunks at
+  # context_length <= 32768 while the buffer covers the largest prefill.
+  chunked_prefill_size: 32768
+  max_running_requests: null
+  skip_tokenizer_init: true
+  enable_return_routed_experts: true
+  # REQUIRED on sm_100. The R3 capture hook lives in select_experts
+  # (_post_process_topk_ids), but TopK.forward_cuda short-circuits to
+  # BypassedTopKOutput for flashinfer_trtllm — which is what "auto" picks
+  # on Blackwell — so nothing is captured and the server still starts,
+  # allocates the capturer and reports healthy. "triton" keeps the standard
+  # top-k path. Verified on a B200: with "auto" the capture probe got no
+  # routed experts; with "triton" it passed.
+  moe_runner_backend: triton
+  # B200 note: leave attention_backend unset so sglang auto-selects for the
+  # arch. FlashInfer autotune hung >12 min on this node; pass
+  # --disable-flashinfer-autotune if startup stalls after
+  # "Running FlashInfer autotune".
