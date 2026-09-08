@@ -191,6 +191,9 @@ class MegatronEngine(TrainEngine):
 
         self.tokenizer = load_hf_tokenizer(self.config.path)
         self.bridge = mbridge.AutoBridge.from_pretrained(self.config.path)
+        if not hasattr(self.bridge.hf_config, "rope_theta"):
+            # transformers>=5 moved it into rope_parameters; mbridge 0.1.0 still reads it
+            self.bridge.hf_config.rope_theta = self.bridge.hf_config.rope_parameters["rope_theta"]
         self.bridge.dtype = self.dtype
         # Set gradient checkpointing options
         if self.config.gradient_checkpointing:
