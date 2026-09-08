@@ -454,6 +454,9 @@ class MegatronEngineConfig:
     # It is recommended to set this option to True for RL training on MoE models for stability.
     use_deterministic_algorithms: bool = False
 
+    # R3: replay rollout-recorded MoE routing in training forwards.
+    moe_router_replay: bool = False
+
     # Gradient checkpointing options, only effective when gradient_checkpointing=True
     recompute_granularity: str | None = "full"
     recompute_method: str | None = "uniform"
